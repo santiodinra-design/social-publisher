@@ -12,7 +12,12 @@
     "desktop:dev": "npm run desktop:build && electron .",
     "icon": "electron scripts/make-icon.cjs",
     "package": "npm run desktop:build && electron-builder --mac dir --arm64 && sh scripts/sign-adhoc.sh",
-    "package:dmg": "npm run package && electron-builder --mac dmg --arm64 --prepackaged \"release/mac-arm64/Publisher.app\""
+    "package:dmg": "npm run package && electron-builder --mac dmg --arm64 --prepackaged \"release/mac-arm64/Publisher.app\"",
+    "windows:test": "cargo test --manifest-path windows/Cargo.toml -p publisher-core",
+    "windows:build": "vite build && cargo build --release --manifest-path windows/Cargo.toml -p publisher",
+    "windows:run": "windows\\target\\release\\Publisher.exe",
+    "relay:test": "vitest run --config relay/vitest.config.ts",
+    "relay:deploy": "npx wrangler deploy --config relay/wrangler.toml"
   },
   "engines": {
     "node": ">=22.13"

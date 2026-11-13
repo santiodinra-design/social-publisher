@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["core", "app"]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+
+# Tuned for a small, fast binary. Unwinding stays on so a panic inside one publishing job is
+# contained by its task instead of taking the whole app (and every other job) down.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+debug = false

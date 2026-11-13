@@ -18,6 +18,18 @@ On first launch choose **Start Fresh**. Demo mode is on, with simulated accounts
 
 To work on it without packaging, run `npm run dev`. That needs a `.env` copied from `.env.example`, with `APP_PASSWORD`, `SESSION_SECRET` and `TOKEN_ENCRYPTION_KEY` filled in (or `NO_SIGN_IN=true` for local-only testing). Then open http://localhost:5173.
 
+## Run it on Windows
+There is also a Windows build written in Rust, in `windows/`. It uses the same interface and the same data format, and needs no Node at run time.
+
+```bash
+npm install
+npm run windows:test    # 34 Rust tests
+npm run windows:build   # builds windows/target/release/Publisher.exe
+npm run windows:run
+```
+
+Requirements, design and what has been checked are in **windows/README.md**. To let customers connect with one click, deploy the sign-in relay and submit the platform applications: both are explained step by step in **relay/README.md**. Its data lives in `%APPDATA%\Publisher` and the encryption key is protected by Windows (DPAPI) for your Windows user.
+
 ## Ground rules
 - Use **your own** developer keys (Google Desktop app OAuth client, Meta app, TikTok app), entered in the app. Never commit keys, `.env`, `data/` or videos (`.gitignore` covers them).
 - No real post goes out without the account owner's explicit go-ahead. Test with demo accounts or a **private** YouTube upload.

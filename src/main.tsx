@@ -1,15 +1,45 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import './styles.css';
-import { api, type Account, type Config, type Post, type Status } from './api';
+import { api, has, type Account, type Config, type Post, type Status } from './api';
+import { computer, logsHint, onWindows } from './desktop';
 import { Icon } from './ui';
+import { enableSounds, sounds } from './sounds';
+
+// The Windows app clicks like Ethereal Enchantment. The Mac app stays silent.
+if (onWindows) enableSounds();
+
+/** Windows app: whether finished posts show a notification. Kept by the app, not the browser. */
+function NotifyToggle() {
+	const [on, setOn] = useState<boolean | null>(null);
+	useEffect(() => void api.prefs().then((p) => setOn(p.notifications)).catch(() => undefined), []);
+	if (on === null) return null;
+	return (
+		<button className="ghost-link" aria-pressed={on} title={on ? 'A notification appears when a post finishes (click to turn off)' : 'Notifications are off (click to turn on)'} onClick={async () => setOn((await api.setPrefs({ notifications: !on })).notifications)}>
+			{on ? <Icon.bell /> : <Icon.bellOff />} <span>{on ? 'Notifications on' : 'Notifications off'}</span>
+		</button>
+	);
+}
+
+function SoundToggle() {
+	const [, redraw] = useState(0);
+	useEffect(() => sounds.subscribe(() => redraw((n) => n + 1)), []);
+	if (!sounds.available) return null;
+	return (
+		<button className="ghost-link" data-sfx={sounds.on ? 'toggleOff' : 'none'} aria-pressed={sounds.on} title={sounds.on ? 'Sounds on (click to mute)' : 'Sounds off (click to turn on)'} onClick={() => sounds.set(!sounds.on)}>
+			{sounds.on ? <Icon.volume /> : <Icon.mute />} <span>{sounds.on ? 'Sounds on' : 'Sounds off'}</span>
+		</button>
+	);
+}
 import { CreatePage } from './pages/Create';
 import { HistoryPage } from './pages/History';
 import { AccountsPage } from './pages/Accounts';
+import { StatsPage } from './pages/Stats';
 
 const PAGES = {
 	'/': { title: 'Create post', sub: 'One video, every platform.', icon: Icon.create },
 	'/history': { title: 'Post history', sub: 'Where every post stands.', icon: Icon.history },
+	'/stats': { title: 'Stats', sub: 'Followers, views and where your audience is.', icon: Icon.chart },
 	'/accounts': { title: 'Connected accounts', sub: 'Official sign-in only. Your passwords never touch this app.', icon: Icon.accounts },
 } as const;
 type Path = keyof typeof PAGES;
@@ -99,7 +129,7 @@ function App() {
 						<small>{live.length ? `${live.length} account${live.length === 1 ? '' : 's'}` : 'No accounts yet'}</small>
 					</div>
 				</div>
-				{(Object.keys(PAGES) as Path[]).map((p) => {
+				{(Object.keys(PAGES) as Path[]).filter((p) => p !== '/stats' || has(config, 'analytics')).map((p) => {
 					const P = PAGES[p];
 					const count = p === '/history' ? (inFlight || attention) : p === '/accounts' ? reconnect : 0;
 					return (
@@ -114,6 +144,8 @@ function App() {
 					{config?.demoMode && <span className="chip demo hide-sm" style={{ justifySelf: 'start', marginLeft: 6 }}>Demo mode</span>}
 					{session.noSignIn && <span className="chip warn signin-off" title="Password protection is off (NO_SIGN_IN=true). Only this computer can open the app. Turn sign-in back on before sharing or tunnelling it.">Sign-in off · local only</span>}
 					<WorkerStatus status={status} inFlight={inFlight} desktop={Boolean(session.desktop)} />
+					<SoundToggle />
+					{has(config, 'notifications') && <NotifyToggle />}
 					{!session.noSignIn && !session.desktop && <button className="ghost-link" aria-label="Sign out" onClick={async () => (await api.signOut(), location.reload())}><Icon.out /> <span>Sign out</span></button>}
 				</div>
 			</nav>
@@ -127,8 +159,10 @@ function App() {
 						<div className="panel empty">Loading…</div>
 					) : path === '/' ? (
 						<CreatePage accounts={accounts} config={config} go={go} onPublished={() => (refreshPosts(), refreshAccounts())} />
+					) : path === '/stats' && has(config, 'analytics') ? (
+						<StatsPage accounts={accounts} go={go} />
 					) : path === '/history' ? (
-						<HistoryPage posts={posts} refresh={refreshPosts} go={go} />
+						<HistoryPage posts={posts} refresh={refreshPosts} go={go} canRepost={has(config, 'repost')} />
 					) : (
 						<AccountsPage accounts={accounts} config={config} refresh={refreshAccounts} refreshConfig={() => api.config().then(setConfig).catch(() => undefined)} />
 					)}
@@ -191,10 +225,10 @@ function WorkerStatus({ status, inFlight, desktop }: { status: Status | null; in
 	const tip =
 		state === 'running'
 			? desktop
-				? `Backend and worker are running (worker checked in ${since} ago). Jobs continue with the window closed, but stop while Publisher is quit or the Mac is asleep; they resume on next launch.`
+				? `Backend and worker are running (worker checked in ${since} ago). Jobs continue with the window closed, but stop while Publisher is quit or the ${computer} is asleep; they resume on next launch.`
 				: `Background worker checked in ${since} ago. Jobs keep going with this tab closed, as long as this computer and the app stay running.`
 			: state === 'stale'
-				? `The background worker last checked in ${since} ago. Queued posts wait until it runs again. ${desktop ? 'Publisher restarts it automatically; if this persists, quit and reopen the app (Help → Reveal Logs in Finder).' : 'Restart the app with npm run dev.'}`
+				? `The background worker last checked in ${since} ago. Queued posts wait until it runs again. ${desktop ? `Publisher restarts it automatically; if this persists, quit and reopen the app (${logsHint}).` : 'Restart the app with npm run dev.'}`
 				: state === 'never'
 					? `The background worker has never checked in. ${desktop ? 'Quit and reopen Publisher.' : 'Start the app with npm run dev.'} Posts wait until it runs.`
 					: `The backend is not responding, so worker status is unknown.${desktop ? ' Publisher restarts it automatically.' : ''}`;

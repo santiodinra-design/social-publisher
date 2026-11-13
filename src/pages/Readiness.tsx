@@ -26,7 +26,7 @@ export function checksFor(a: Account, o: { config: Config; issues: Issue[]; uplo
 		else if (o.verify?.ok) out.push({ kind: 'ok', text: `Connection verified live at ${new Date(o.verify.checkedAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}` });
 		else if (o.verify) out.push({ kind: o.verify.reconnect ? 'stop' : 'warn', text: o.verify.message, fix: o.verify.reconnect ? 'accounts' : 'verify' });
 		else out.push({ kind: 'info', text: 'Connection saved, not checked live', fix: 'verify' });
-		if (a.platform === 'instagram') out.push(o.config.publicBaseUrl ? { kind: 'ok', text: 'Public video address set' } : { kind: 'stop', text: 'Public HTTPS address missing (Instagram downloads the video from it)', fix: 'accounts' });
+		if (a.platform === 'instagram') out.push(o.config.publicBaseUrl ? { kind: 'ok', text: 'Public video address set' } : o.config.videoHosting ? { kind: 'ok', text: 'Instagram downloads the video from temporary storage' } :{ kind: 'stop', text: 'Public HTTPS address missing (Instagram downloads the video from it)', fix: 'accounts' });
 	}
 	if (o.uploadStatus === 'uploading') out.push({ kind: 'stop', text: 'Waiting for the video upload to finish' });
 	else if (o.uploadStatus !== 'done') out.push({ kind: 'stop', text: 'Add a video', fix: 'video' });

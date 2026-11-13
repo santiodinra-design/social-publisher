@@ -1,0 +1,19 @@
+{
+	"$schema": "https://schema.tauri.app/config/2",
+	"productName": "Publisher",
+	"version": "1.0.0",
+	"identifier": "local.socialpublisher.publisher",
+	"build": {},
+	"app": {
+		"windows": [],
+		"security": { "csp": null }
+	},
+	"bundle": {
+		"active": true,
+		"targets": ["nsis"],
+		"icon": ["icons/icon.ico"],
+		"copyright": "Personal build",
+		"shortDescription": "Publish one video to YouTube, Instagram Reels and TikTok.",
+		"windows": { "webviewInstallMode": { "type": "downloadBootstrapper" } }
+	}
+}

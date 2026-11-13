@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { api, ApiError, fmtBytes, fmtDur, PLATFORM_NAME, uploadVideo, type Account, type Config, type Issue, type Media, type Platform, type Post, type Verify } from '../api';
+import { api, ApiError, fmtBytes, fmtDur, has, PLATFORM_NAME, uploadVideo, type Account, type Config, type Issue, type Media, type Platform, type Post, type Verify } from '../api';
 import { Avatar, FieldError, Icon, PlatformMark, Seg, Toggle } from '../ui';
-import { clearDraft, loadDraft, saveDraft } from '../draft';
+import { clearDraft, loadDraft, saveDraft, takeRepost } from '../draft';
 import { issuesFor, Readiness, TIKTOK_INBOX_LABEL } from './Readiness';
 import { PublishStatus } from './Results';
 import { desktop } from '../desktop';
@@ -15,6 +15,12 @@ function defaults(p: Platform, filename: string): Settings {
 	if (p === 'instagram') return { ...base, shareToFeed: true, thumbSec: '' };
 	return { ...base, title: filename.replace(/\.[^.]+$/, '').replace(/[_-]+/g, ' ').slice(0, 100), description: '', privacy: '', madeForKids: null, categoryId: '22' };
 }
+
+/** A <input type="datetime-local"> value for a time, in this computer's time zone. */
+export const toLocalInput = (ms: number) => new Date(ms - new Date(ms).getTimezoneOffset() * 60_000).toISOString().slice(0, 16);
+/** The cover a published destination used, for Post again. */
+const coverOf = (s: Settings) => (s.coverId ? { coverId: String(s.coverId), coverUrl: `/api/covers/${s.coverId}` } : {});
+const nextHalfHour = () => Math.ceil((Date.now() + 15 * 60_000) / 1_800_000) * 1_800_000;
 
 const PREVIEW_LABEL: Record<Platform, string> = { tiktok: 'TikTok', instagram: 'Reels', youtube: 'Shorts' };
 
@@ -38,6 +44,11 @@ export function CreatePage({ accounts, config, go, onPublished }: { accounts: Ac
 	const [formError, setFormError] = useState<string | null>(null);
 	const [busy, setBusy] = useState(false);
 	const [key, setKey] = useState(newKey);
+	const canSchedule = has(config, 'schedule');
+	const canCover = has(config, 'covers');
+	const [scheduleOn, setScheduleOn] = useState(false);
+	const [when, setWhen] = useState(() => toLocalInput(nextHalfHour()));
+	const whenMs = new Date(when).getTime();
 	const [post, setPost] = useState<Post | null>(null);
 	const inputRef = useRef<HTMLInputElement>(null);
 
@@ -52,8 +63,53 @@ export function CreatePage({ accounts, config, go, onPublished }: { accounts: Ac
 
 	useEffect(() => () => void revoke(preview), [preview]);
 
+	// "Post again" from Post history: copy that post into the form. Nothing is submitted.
+	function repost(p: Post) {
+		const ok = new Set(usable.map((a) => a.id));
+		const picked = p.targets.filter((t) => t.accountId && ok.has(t.accountId));
+		const form: Record<string, Settings> = {};
+		for (const t of picked) {
+			const s = t.settings ?? {};
+			const own = String(s.captionOverride ?? '');
+			if (t.platform === 'tiktok') form[t.accountId!] = { ...defaults('tiktok', p.media.filename), overrideOn: Boolean(own.trim()), captionOverride: own, mode: s.mode ?? 'inbox', privacy: s.privacy ?? 'SELF_ONLY', allowComments: s.allowComments ?? true, allowDuet: s.allowDuet ?? false, allowStitch: s.allowStitch ?? false };
+			else if (t.platform === 'instagram') form[t.accountId!] = { ...defaults('instagram', p.media.filename), overrideOn: Boolean(own.trim()), captionOverride: own, shareToFeed: s.shareToFeed !== false, ...coverOf(s), thumbSec: s.thumbOffsetMs == null ? '' : String(Number(s.thumbOffsetMs) / 1000) };
+			else form[t.accountId!] = { ...defaults('youtube', p.media.filename), title: String(s.title ?? ''), titleTouched: true, description: s.description && s.description !== p.caption ? String(s.description) : '', privacy: s.privacy ?? '', madeForKids: typeof s.madeForKids === 'boolean' ? s.madeForKids : null, categoryId: String(s.categoryId ?? '22'), ...coverOf(s) };
+		}
+		setCaption(p.caption);
+		setSelected(picked.map((t) => t.accountId!));
+		setSettings(form);
+		setTab(picked[0]?.accountId ?? null);
+		if (picked[0]) setPreviewAs(picked[0].platform);
+		setKey(newKey());
+		const when = new Date(p.createdAt).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+		const missing = p.targets.length - picked.length;
+		const left = missing ? ` ${missing} destination${missing > 1 ? 's are' : ' is'} no longer connected, so ${missing > 1 ? 'they were' : 'it was'} left out.` : '';
+		if (!p.media.id || p.media.deleted) {
+			setUpload({ progress: 0, status: 'idle' });
+			return setNotice({ tone: 'warn', text: `Copied your post from ${when}. Its video was cleaned up after the retention period, so add the video again.${left}` });
+		}
+		setUpload({ progress: 0, status: 'restoring' });
+		api
+			.media(p.media.id)
+			.then((m) => {
+				setUpload({ progress: 1, status: 'done', media: m });
+				setPreview(m.previewUrl ?? null);
+				setNotice({ tone: 'info', text: `Copied your post from ${when}, with the same video. Change anything you like, then publish.${left}` });
+			})
+			.catch(() => {
+				setUpload({ progress: 0, status: 'idle' });
+				setNotice({ tone: 'warn', text: `Copied your post from ${when}. Its video is no longer on this computer, so add it again.${left}` });
+			});
+	}
+
 	// Restore a saved draft once. It only fills the form: nothing is submitted.
 	useEffect(() => {
+		const again = takeRepost();
+		if (again) {
+			hydrated.current = true;
+			api.post(again).then(repost).catch(() => setNotice({ tone: 'warn', text: 'That post could not be loaded.' }));
+			return;
+		}
 		const d = loadDraft();
 		hydrated.current = true;
 		if (!d) return;
@@ -160,6 +216,7 @@ export function CreatePage({ accounts, config, go, onPublished }: { accounts: Ac
 		if (upload.status !== 'done') out.push({ field: 'media', message: upload.status === 'uploading' ? 'Wait for the upload to finish.' : upload.status === 'restoring' ? 'Finding the video from your draft…' : 'Add a video first.' });
 		if (!chosen.length) out.push({ field: 'targets', message: 'Choose at least one destination.' });
 		if (mixDemo) out.push({ field: 'targets', message: 'Demo and real accounts cannot be in the same post.' });
+		if (scheduleOn && !(whenMs > Date.now() + 60_000 && whenMs < Date.now() + 60 * 86_400_000)) out.push({ field: 'scheduledAt', message: 'Pick a time at least a minute from now and within 60 days.' });
 		for (const a of chosen) {
 			const s = settings[a.id] ?? {};
 			const cap = s.overrideOn && s.captionOverride.trim() ? s.captionOverride : caption;
@@ -169,7 +226,7 @@ export function CreatePage({ accounts, config, go, onPublished }: { accounts: Ac
 				const info = config.platforms[a.platform];
 				if (!info.configured) out.push({ field: `account.${a.id}`, message: `Add ${PLATFORM_NAME[a.platform]} app keys in Connected accounts.` });
 				else if (!info.available) out.push({ field: `account.${a.id}`, message: info.note });
-				if (a.platform === 'instagram' && !config.publicBaseUrl) out.push({ field: `account.${a.id}`, message: 'Set a public HTTPS address in Connected accounts so Instagram can download the video.' });
+				if (a.platform === 'instagram' && !config.publicBaseUrl && !config.videoHosting) out.push({ field: `account.${a.id}`, message: 'Set a public HTTPS address in Connected accounts so Instagram can download the video.' });
 			}
 			if (a.platform === 'youtube') {
 				if (!String(s.title ?? '').trim()) out.push({ field: 'youtube.title', message: 'Add a title.' });
@@ -214,12 +271,14 @@ export function CreatePage({ accounts, config, go, onPublished }: { accounts: Ac
 				idempotencyKey: key,
 				mediaId: upload.media!.id,
 				caption,
+				...(scheduleOn ? { scheduledAt: whenMs } : {}),
 				targets: chosen.map((a) => {
 					const s = settings[a.id];
 					const common = { captionOverride: s.overrideOn ? s.captionOverride : '' };
 					if (a.platform === 'tiktok') return { accountId: a.id, settings: { ...common, mode: s.mode, privacy: s.privacy, allowComments: s.allowComments, allowDuet: s.allowDuet, allowStitch: s.allowStitch } };
-					if (a.platform === 'instagram') return { accountId: a.id, settings: { ...common, shareToFeed: s.shareToFeed, thumbOffsetMs: s.thumbSec === '' ? null : Math.round(Number(s.thumbSec) * 1000) } };
-					return { accountId: a.id, settings: { title: s.title, description: s.description || caption, privacy: s.privacy, madeForKids: s.madeForKids, categoryId: s.categoryId } };
+					const cover = canCover && s.coverId ? { coverId: s.coverId } : {};
+					if (a.platform === 'instagram') return { accountId: a.id, settings: { ...common, ...cover, shareToFeed: s.shareToFeed, thumbOffsetMs: s.thumbSec === '' ? null : Math.round(Number(s.thumbSec) * 1000) } };
+					return { accountId: a.id, settings: { ...cover, title: s.title, description: s.description || caption, privacy: s.privacy, madeForKids: s.madeForKids, categoryId: s.categoryId } };
 				}),
 			});
 			setPost(r.post);
@@ -248,6 +307,7 @@ export function CreatePage({ accounts, config, go, onPublished }: { accounts: Ac
 		setFormError(null);
 		setNotice(null);
 		setKey(newKey());
+		setScheduleOn(false);
 	}
 
 	function discard() {
@@ -395,7 +455,7 @@ export function CreatePage({ accounts, config, go, onPublished }: { accounts: Ac
 									</button>
 								))}
 							</div>
-							<PlatformFields a={activeTab} s={settings[activeTab.id] ?? defaults(activeTab.platform, filename)} set={(p) => set(activeTab.id, p)} issues={issues} info={config.platforms[activeTab.platform]} caption={caption} media={media} locked={locked} />
+							<PlatformFields a={activeTab} s={settings[activeTab.id] ?? defaults(activeTab.platform, filename)} set={(p) => set(activeTab.id, p)} issues={issues} info={config.platforms[activeTab.platform]} caption={caption} media={media} locked={locked} canCover={canCover} />
 						</div>
 					)}
 
@@ -431,8 +491,16 @@ export function CreatePage({ accounts, config, go, onPublished }: { accounts: Ac
 								)}
 								{hasDraft && <span className="draft-tag">Draft saved<button type="button" className="linkish" onClick={discard}>Discard draft</button></span>}
 							</div>
-							<button className="btn primary big" onClick={publish} disabled={busy || blocking > 0} aria-busy={busy} title={blocking ? 'Fix the items in the checklist first' : undefined}>
-								<Icon.play /> {busy ? 'Starting…' : anyDemo ? 'Publish (simulated)' : 'Publish'}
+							{canSchedule && (
+								<div className="schedule">
+									<button type="button" className={`btn sm ${scheduleOn ? 'on' : 'quiet'}`} aria-pressed={scheduleOn} onClick={() => setScheduleOn(!scheduleOn)} title="Publish later, at a time you pick">
+										<Icon.clock /> {scheduleOn ? 'Scheduled' : 'Schedule'}
+									</button>
+									{scheduleOn && <input className={`field mono ${issues.some((i) => i.field === 'scheduledAt') ? 'bad' : ''}`} type="datetime-local" value={when} min={toLocalInput(Date.now() + 2 * 60_000)} onChange={(e) => setWhen(e.target.value)} aria-label="Publish at" />}
+								</div>
+							)}
+							<button className="btn primary big" data-sfx="launch" onClick={publish} disabled={busy || blocking > 0} aria-busy={busy} title={blocking ? 'Fix the items in the checklist first' : undefined}>
+								{scheduleOn ? <Icon.clock /> : <Icon.play />} {busy ? 'Starting…' : scheduleOn ? (anyDemo ? 'Schedule (simulated)' : 'Schedule') : anyDemo ? 'Publish (simulated)' : 'Publish'}
 							</button>
 						</div>
 					)}
@@ -442,7 +510,7 @@ export function CreatePage({ accounts, config, go, onPublished }: { accounts: Ac
 	);
 }
 
-function PlatformFields({ a, s, set, issues, info, caption, media, locked }: { a: Account; s: Settings; set: (p: Settings) => void; issues: Issue[]; info: Config['platforms'][Platform]; caption: string; media?: Media; locked: boolean }) {
+function PlatformFields({ a, s, set, issues, info, caption, media, locked, canCover = false }: { a: Account; s: Settings; set: (p: Settings) => void; issues: Issue[]; info: Config['platforms'][Platform]; caption: string; media?: Media; locked: boolean; canCover?: boolean }) {
 	return (
 		<div className="fields" role="tabpanel">
 			<FieldError issues={issues} field={`media.${a.platform}`} />
@@ -471,6 +539,7 @@ function PlatformFields({ a, s, set, issues, info, caption, media, locked }: { a
 						<summary>Why not post directly?</summary>
 						<p>TikTok only lets audited apps post publicly, and it does not audit personal tools that post to your own accounts. Sending it to your TikTok inbox is the supported way: TikTok notifies you, and you add sounds or effects and post it from the app. Nothing is public until you do.</p>
 					</details>
+					{canCover && <div className="hint">TikTok lets you pick the cover when you finish the draft in the TikTok app.</div>}
 					{info.mode === 'direct' && !a.isDemo && (
 						<div style={{ marginTop: 12 }}>
 							<Seg label="TikTok mode" value={s.mode} onChange={(v) => set({ mode: v })} options={[{ value: 'inbox', label: 'Inbox' }, { value: 'direct', label: 'Direct (private only)', disabled: locked }]} />
@@ -493,6 +562,7 @@ function PlatformFields({ a, s, set, issues, info, caption, media, locked }: { a
 						</div>
 						<FieldError issues={issues} field="instagram.thumb" />
 					</label>
+					{canCover && <CoverPicker label="Cover image" hint="JPEG. Replaces the cover frame above." s={s} set={set} locked={locked} accept="image/jpeg" issues={issues} field="instagram.cover" />}
 					{!info.available && !a.isDemo && <div className="notice warn"><Icon.info /><span>{info.note}</span></div>}
 				</>
 			)}
@@ -521,9 +591,48 @@ function PlatformFields({ a, s, set, issues, info, caption, media, locked }: { a
 							<FieldError issues={issues} field="youtube.madeForKids" />
 						</div>
 					</div>
+					{canCover && <CoverPicker label="Thumbnail" hint="JPEG or PNG, up to 2 MB, 1280×720 works best. Needs a verified YouTube channel; otherwise YouTube keeps its own." s={s} set={set} locked={locked} accept="image/jpeg,image/png" issues={issues} field="youtube.cover" />}
 					<div className="hint" style={{ marginTop: 0 }}>{media ? (media.shortsShape ? 'Vertical and 3 minutes or less, so this posts as a Short.' : 'This posts as a regular video. Shorts must be vertical or square and up to 3 minutes.') : 'Vertical videos up to 3 minutes post as Shorts.'}</div>
 				</>
 			)}
+		</div>
+	);
+}
+
+/** Chooses a cover image for one destination. The image is saved by the app straight away. */
+function CoverPicker({ label, hint, s, set, locked, accept, issues, field }: { label: string; hint: string; s: Settings; set: (p: Settings) => void; locked: boolean; accept: string; issues: Issue[]; field: string }) {
+	const ref = useRef<HTMLInputElement>(null);
+	const [busy, setBusy] = useState(false);
+	const [err, setErr] = useState<string | null>(null);
+	async function choose(f?: File | null) {
+		if (!f) return;
+		setBusy(true);
+		setErr(null);
+		try {
+			const c = await api.uploadCover(f);
+			set({ coverId: c.id, coverUrl: c.url });
+		} catch (e: any) {
+			setErr(e.message);
+		} finally {
+			setBusy(false);
+		}
+	}
+	return (
+		<div className="f">
+			<span>{label}</span>
+			<div className="cover-pick">
+				{s.coverUrl ? <img src={s.coverUrl} alt="" /> : <span className="cover-empty"><Icon.image /></span>}
+				<div className="stack" style={{ gap: 6 }}>
+					<div className="row" style={{ gap: 6 }}>
+						<button type="button" className="btn sm" disabled={locked || busy} onClick={() => ref.current?.click()}>{busy ? 'Saving…' : s.coverId ? 'Replace' : 'Choose image'}</button>
+						{s.coverId && <button type="button" className="btn sm quiet" disabled={locked || busy} onClick={() => set({ coverId: '', coverUrl: '' })}>Remove</button>}
+					</div>
+					<span className="hint" style={{ margin: 0 }}>{hint}</span>
+				</div>
+			</div>
+			<input ref={ref} type="file" accept={accept} hidden onChange={(e) => (choose(e.target.files?.[0]), (e.target.value = ''))} />
+			{err && <div className="err" role="alert">{err}</div>}
+			<FieldError issues={issues} field={field} />
 		</div>
 	);
 }

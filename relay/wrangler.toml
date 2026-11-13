@@ -1,0 +1,21 @@
+# Publisher sign-in relay. Deploy with `npx wrangler deploy` from this folder (see README.md).
+name = "publisher-relay"
+main = "src/index.ts"
+compatibility_date = "2026-10-01"
+
+# Delete hosted Instagram videos older than 24 hours.
+[triggers]
+crons = ["17 * * * *"]
+
+[[r2_buckets]]
+binding = "MEDIA"
+bucket_name = "publisher-media"
+
+[vars]
+# Public values. Client secrets and SIGNING_KEY are set with `npx wrangler secret put <NAME>`, never here.
+OPERATOR_NAME = ""
+CONTACT_EMAIL = ""
+GOOGLE_CLIENT_ID = ""
+TIKTOK_CLIENT_KEY = ""
+INSTAGRAM_APP_ID = ""
+INSTAGRAM_API_VERSION = "v25.0"
