@@ -3,6 +3,7 @@ import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../server/app.js';
 import { getDb } from '../server/db.js';
 import { config } from '../server/config.js';
+import { saveSettings } from '../server/settings.js';
 import { freshDb, seedAccount, seedMedia } from './helpers.js';
 
 let app: FastifyInstance;
@@ -27,6 +28,13 @@ afterEach(async () => {
 });
 
 describe('access control', () => {
+	it('serves the Terms and Privacy pages without signing in', async () => {
+		for (const url of ['/terms', '/privacy']) {
+			const r = await app.inject({ method: 'GET', url });
+			expect(r.statusCode).toBe(200);
+			expect(r.headers['content-type']).toMatch(/text\/html/);
+		}
+	});
 	it('blocks the API without signing in', async () => {
 		expect((await app.inject({ method: 'GET', url: '/api/accounts' })).statusCode).toBe(401);
 		expect((await app.inject({ method: 'POST', url: '/api/posts', payload: {} })).statusCode).toBe(401);
@@ -64,6 +72,7 @@ describe('tokens', () => {
 
 describe('publishing validation', () => {
 	it('explains each problem next to the right field', async () => {
+		saveSettings({ DRAFTS_ONLY: 'off' }); // with drafts only, privacy is forced and Instagram refused
 		const m = seedMedia(1024 * 1024, { duration: 1 });
 		const yt = seedAccount('youtube');
 		const ig = seedAccount('instagram');
@@ -119,7 +128,7 @@ describe('OAuth', () => {
 	it('handles a refused sign-in with a clear message', async () => {
 		const r = await get('/api/oauth/instagram/callback?error=access_denied&error_description=User+denied');
 		expect(r.statusCode).toBe(302);
-		expect(decodeURIComponent(r.headers.location as string)).toContain('User denied');
+		expect(decodeURIComponent(r.headers.location as string)).toContain('Instagram cancelled the sign-in');
 	});
 
 	it('rejects a callback whose state does not match', async () => {

@@ -13,17 +13,19 @@ export function backoffMs(attempt: number, hint?: number) {
 type NewTarget = { accountId: string; platform: string; settings: Record<string, unknown> };
 
 /** Creates a post once. Submitting the same idempotency key again returns the original post. */
-export function createPost(input: { idempotencyKey: string; mediaId: string; caption: string; isDemo: boolean; targets: NewTarget[] }) {
+/** With `scheduledAt`, every destination waits in the queue until that time. */
+export function createPost(input: { idempotencyKey: string; mediaId: string; caption: string; isDemo: boolean; targets: NewTarget[]; scheduledAt?: number | null }) {
 	const db = getDb();
 	const existing = db.prepare('SELECT id FROM posts WHERE idempotency_key = ?').get(input.idempotencyKey) as { id: string } | undefined;
 	if (existing) return { id: existing.id, duplicate: true };
 	const id = randomId(10);
 	const t = now();
+	const due = input.scheduledAt ?? t;
 	db.exec('BEGIN IMMEDIATE');
 	try {
-		db.prepare('INSERT INTO posts (id, idempotency_key, media_id, caption, is_demo, created_at) VALUES (?, ?, ?, ?, ?, ?)').run(id, input.idempotencyKey, input.mediaId, input.caption, input.isDemo ? 1 : 0, t);
+		db.prepare('INSERT INTO posts (id, idempotency_key, media_id, caption, is_demo, created_at, scheduled_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run(id, input.idempotencyKey, input.mediaId, input.caption, input.isDemo ? 1 : 0, t, input.scheduledAt ?? null);
 		const ins = db.prepare('INSERT INTO targets (id, post_id, account_id, platform, settings, state, next_run_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, \'queued\', ?, ?, ?)');
-		for (const tg of input.targets) ins.run(randomId(10), id, tg.accountId, tg.platform, JSON.stringify(tg.settings), t, t, t);
+		for (const tg of input.targets) ins.run(randomId(10), id, tg.accountId, tg.platform, JSON.stringify(tg.settings), due, t, t);
 		db.exec('COMMIT');
 	} catch (e) {
 		db.exec('ROLLBACK');
@@ -153,13 +155,68 @@ export function retryTargets(postId: string, targetIds?: string[]) {
 		db.prepare("UPDATE targets SET state = 'queued', attempts = 0, next_run_at = ?, error = NULL, uncertain = CASE WHEN uncertain = 1 OR provider_ref IS NOT NULL OR remote_id IS NOT NULL THEN 1 ELSE 0 END, updated_at = ? WHERE id = ?").run(now(), now(), r.id);
 		addEvent(r.id, 'Retry requested.');
 	}
+	if (picked.length) db.prepare('UPDATE posts SET notified_at = NULL WHERE id = ?').run(postId);
 	return picked.map((r) => r.id);
+}
+
+// ---------- scheduling, "I posted it" (same rules as the Windows build) ----------
+export const MAX_SCHEDULE_MS = 60 * 86_400_000;
+/** Destinations still only waiting for their scheduled time: never started, nothing sent. */
+const WAITING = "state = 'queued' AND attempts = 0 AND uncertain = 0 AND provider_ref IS NULL AND remote_id IS NULL AND lease_owner IS NULL";
+export const validScheduleTime = (at: unknown) => typeof at === 'number' && Number.isInteger(at) && at > now() + 60_000 && at < now() + MAX_SCHEDULE_MS;
+
+/** Moves a scheduled post to another time, or to now when `at` is null. Only destinations that have not started move. */
+export function reschedule(postId: string, at: number | null) {
+	const db = getDb();
+	const ids = (db.prepare(`SELECT id FROM targets WHERE post_id = ? AND ${WAITING}`).all(postId) as { id: string }[]).map((r) => r.id);
+	for (const id of ids) {
+		db.prepare('UPDATE targets SET next_run_at = ?, updated_at = ? WHERE id = ?').run(at ?? now(), now(), id);
+		addEvent(id, at != null ? 'Schedule changed.' : 'Publishing now instead of at the scheduled time.');
+	}
+	if (ids.length) db.prepare('UPDATE posts SET scheduled_at = ?, notified_at = NULL WHERE id = ?').run(at, postId);
+	return ids.length;
+}
+
+/** Cancels the not-yet-started destinations of a scheduled post. They end as failed; Retry posts them now. */
+export function cancelScheduled(postId: string) {
+	const db = getDb();
+	const ids = (db.prepare(`SELECT id FROM targets WHERE post_id = ? AND next_run_at > ? AND ${WAITING}`).all(postId, now()) as { id: string }[]).map((r) => r.id);
+	for (const id of ids) {
+		finish(id, 'failed', { error: 'Cancelled before the scheduled time. Retry posts it now.' });
+		addEvent(id, 'Schedule cancelled.');
+	}
+	return ids.length;
+}
+
+export const canMarkPosted = (t: Pick<TargetRow, 'platform' | 'state'>) => t.platform === 'tiktok' && t.state === 'needs_attention';
+
+/** A TikTok address, if one was given. Anything else is refused rather than stored. */
+export function tiktokLink(raw: string): { ok: true; link: string | null } | { ok: false; message: string } {
+	const s = raw.trim();
+	if (!s) return { ok: true, link: null };
+	try {
+		const u = new URL(s);
+		if (u.protocol === 'https:' && (u.hostname === 'tiktok.com' || u.hostname.endsWith('.tiktok.com'))) return { ok: true, link: s };
+	} catch {}
+	return { ok: false, message: 'Paste the post\'s TikTok link (https://www.tiktok.com/…), or leave it empty.' };
+}
+
+/** The owner finished a TikTok inbox draft by hand. Returns the post ID. */
+export function markPosted(targetId: string, permalink: string | null) {
+	const t = getTarget(targetId);
+	if (!t) throw new Error('Not found');
+	if (!canMarkPosted(t)) throw new Error('Only TikTok drafts waiting in the inbox can be marked as posted.');
+	finish(t.id, 'published', { permalink });
+	getDb().prepare('UPDATE targets SET error = NULL WHERE id = ?').run(t.id);
+	addEvent(t.id, 'Marked as posted by hand in TikTok.');
+	return t.post_id;
 }
 
 export function postView(postId: string) {
 	const db = getDb();
 	const post = db.prepare('SELECT p.*, m.filename, m.duration, m.width, m.height, m.size, m.deleted_at FROM posts p JOIN media m ON m.id = p.media_id WHERE p.id = ?').get(postId) as any;
 	if (!post) return null;
+	const waiting = (r: any) => post.scheduled_at != null && r.state === 'queued' && r.attempts === 0 && !r.uncertain && !r.provider_ref && !r.remote_id && r.next_run_at > now();
 	const targets = db
 		.prepare('SELECT t.*, a.display_name, a.handle, a.avatar_url, a.is_demo AS account_demo, a.status AS account_status FROM targets t JOIN accounts a ON a.id = t.account_id WHERE t.post_id = ? ORDER BY t.platform')
 		.all(postId) as any[];
@@ -169,7 +226,9 @@ export function postView(postId: string) {
 		caption: post.caption,
 		isDemo: Boolean(post.is_demo),
 		createdAt: post.created_at,
-		media: { filename: post.filename, duration: post.duration, width: post.width, height: post.height, size: post.size, deleted: Boolean(post.deleted_at) },
+		scheduledAt: post.scheduled_at ?? null,
+		scheduled: targets.some((t) => waiting(t)),
+		media: { id: post.media_id, filename: post.filename, duration: post.duration, width: post.width, height: post.height, size: post.size, deleted: Boolean(post.deleted_at) },
 		targets: targets.map((t) => ({
 			id: t.id,
 			platform: t.platform,
@@ -182,6 +241,9 @@ export function postView(postId: string) {
 			outcomeUnknown: Boolean(t.uncertain) && !['published'].includes(t.state),
 			accountStatus: t.account_status,
 			nextRunAt: t.state === 'queued' ? t.next_run_at : null,
+			scheduled: waiting(t),
+			canMarkPosted: canMarkPosted(t),
+			accountId: t.account_id,
 			error: t.error,
 			permalink: post.is_demo ? null : t.permalink,
 			updatedAt: t.updated_at,

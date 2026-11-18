@@ -9,6 +9,8 @@ export type Draft = {
 	settings: Record<string, Record<string, unknown>>;
 	tab: string | null;
 	previewAs: Platform;
+	/** Music choice for the copyright checks. Optional so older drafts still load. */
+	music?: 'none' | 'free' | 'song';
 	mediaId: string | null;
 	/** Reused on restore, so publishing a draft that already went out returns that post instead of a second one. */
 	key: string;
@@ -16,7 +18,7 @@ export type Draft = {
 };
 
 const KEY = 'sp.draft.v1';
-const ALLOWED = new Set(['overrideOn', 'captionOverride', 'mode', 'privacy', 'allowComments', 'allowDuet', 'allowStitch', 'shareToFeed', 'thumbSec', 'title', 'titleTouched', 'description', 'madeForKids', 'categoryId']);
+const ALLOWED = new Set(['overrideOn', 'captionOverride', 'mode', 'privacy', 'allowComments', 'allowDuet', 'allowStitch', 'shareToFeed', 'thumbSec', 'title', 'titleTouched', 'description', 'madeForKids', 'categoryId', 'coverId', 'coverUrl']);
 
 export function loadDraft(): Draft | null {
 	try {
@@ -42,4 +44,21 @@ export function clearDraft() {
 	try {
 		localStorage.removeItem(KEY);
 	} catch {}
+}
+
+// "Post again" from Post history: the composer picks this up once, then forgets it.
+const REPOST = 'sp.repost';
+export function queueRepost(postId: string) {
+	try {
+		sessionStorage.setItem(REPOST, postId);
+	} catch {}
+}
+export function takeRepost(): string | null {
+	try {
+		const id = sessionStorage.getItem(REPOST);
+		sessionStorage.removeItem(REPOST);
+		return id;
+	} catch {
+		return null;
+	}
 }

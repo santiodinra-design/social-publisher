@@ -1,7 +1,7 @@
 // Publisher desktop app: main process.
 // Owns the window, the menu and the quit flow, keeps the encryption keys in the macOS Keychain
 // (via safeStorage), and supervises two utility processes: the local API server and the publishing worker.
-import { app, BrowserWindow, dialog, ipcMain, Menu, safeStorage, session, shell, utilityProcess, type UtilityProcess } from 'electron';
+import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, Notification, safeStorage, session, shell, utilityProcess, type UtilityProcess } from 'electron';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import net from 'node:net';
@@ -16,6 +16,8 @@ app.setName(APP_NAME);
 const userData = app.getPath('userData'); // ~/Library/Application Support/Publisher
 const dataDir = path.join(userData, 'data');
 const logsDir = path.join(userData, 'logs');
+/** Where the owner's Claude sessions drop finished videos (the API process watches it). */
+const inboxDir = path.join(app.getPath('home'), 'Movies', 'Publisher Inbox');
 const settingsFile = path.join(userData, 'settings.json');
 const res = (...p: string[]) => (app.isPackaged ? path.join(process.resourcesPath, ...p) : path.join(app.getAppPath(), 'build', 'resources', ...p));
 const bundled = (...p: string[]) => path.join(app.getAppPath(), ...p);
@@ -106,6 +108,7 @@ function serviceEnv(): Record<string, string> {
 		SESSION_SECRET: keys!.sessionSecret,
 		TOKEN_ENCRYPTION_KEY: keys!.tokenKey,
 		DATA_DIR: dataDir,
+		INBOX_DIR: inboxDir,
 		API_PORT: String(port),
 		APP_URL: origin,
 		UI_DIST: bundled('dist'),
@@ -137,6 +140,8 @@ function start(name: 'api' | 'worker'): Promise<void> {
 				svc.state = 'running';
 				log(`${name} ready`);
 				resolve();
+			} else if (m?.type === 'notice' && name === 'worker') {
+				announce(m.notice);
 			} else if (m?.type === 'fatal') {
 				clearTimeout(timer);
 				reject(new Error(String(m.message ?? 'failed to start')));
@@ -182,6 +187,22 @@ async function supervise(name: 'api' | 'worker') {
 	}
 }
 
+/** A post finished: a macOS notification plus the app's finish sound (played by the page, even while hidden). */
+function announce(n: { postId?: string; title?: string; body?: string; ok?: boolean; copy?: string }) {
+	if (!n || typeof n.title !== 'string') return;
+	// TikTok drafts cannot carry a caption, so it goes on the clipboard (Universal Clipboard reaches the iPhone).
+	if (typeof n.copy === 'string' && n.copy.trim()) clipboard.writeText(n.copy.slice(0, 5000));
+	const ok = n.ok !== false;
+	win?.webContents.executeJavaScript(`window.__publisherFinished && window.__publisherFinished({ ok: ${ok} })`).catch(() => undefined);
+	if (!Notification.isSupported()) return;
+	const note = new Notification({ title: n.title.slice(0, 120), body: String(n.body ?? '').slice(0, 240), silent: true });
+	note.on('click', () => {
+		showWindow();
+		win?.webContents.executeJavaScript("history.pushState(null, '', '/history'); dispatchEvent(new PopStateEvent('popstate'))").catch(() => undefined);
+	});
+	note.show();
+}
+
 async function stopServices() {
 	const w = svcs.worker.proc;
 	if (w) {
@@ -213,6 +234,8 @@ function createWindow() {
 			webviewTag: false,
 			spellcheck: false,
 			devTools: !app.isPackaged,
+			// Let the finish sound play while the window is closed (hidden).
+			backgroundThrottling: false,
 		},
 	});
 	win.once('ready-to-show', () => win?.show());
@@ -272,6 +295,11 @@ function registerIpc() {
 	});
 	ipcMain.handle('reveal-logs', async (e) => {
 		if (fromApp(e)) await shell.openPath(logsDir);
+	});
+	ipcMain.handle('reveal-inbox', async (e) => {
+		if (!fromApp(e)) return;
+		fs.mkdirSync(inboxDir, { recursive: true });
+		await shell.openPath(inboxDir);
 	});
 	ipcMain.handle('services', async (e) => {
 		if (!fromApp(e)) return null;
@@ -337,6 +365,7 @@ function buildMenu() {
 				role: 'help',
 				submenu: [
 					{ label: 'Reveal Logs in Finder', click: () => shell.openPath(logsDir) },
+					{ label: 'Reveal Inbox Folder in Finder', click: () => (fs.mkdirSync(inboxDir, { recursive: true }), shell.openPath(inboxDir)) },
 					{ label: 'Reveal Data Folder in Finder', click: () => shell.openPath(userData) },
 				],
 			},

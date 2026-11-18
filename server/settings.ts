@@ -6,10 +6,10 @@ import { open, seal } from './crypto.js';
 
 export const FIELDS: Record<Platform, { id: string; secret: string; idLabel: string; secretLabel: string }> = {
 	youtube: { id: 'GOOGLE_CLIENT_ID', secret: 'GOOGLE_CLIENT_SECRET', idLabel: 'Client ID', secretLabel: 'Client secret' },
-	instagram: { id: 'INSTAGRAM_APP_ID', secret: 'INSTAGRAM_APP_SECRET', idLabel: 'Instagram app ID', secretLabel: 'Instagram app secret' },
+	instagram: { id: 'INSTAGRAM_APP_ID', secret: 'INSTAGRAM_APP_SECRET', idLabel: 'App ID', secretLabel: 'App secret' },
 	tiktok: { id: 'TIKTOK_CLIENT_KEY', secret: 'TIKTOK_CLIENT_SECRET', idLabel: 'Client key', secretLabel: 'Client secret' },
 };
-const ALLOWED = new Set([...Object.values(FIELDS).flatMap((f) => [f.id, f.secret]), 'PUBLIC_BASE_URL']);
+const ALLOWED = new Set([...Object.values(FIELDS).flatMap((f) => [f.id, f.secret]), 'PUBLIC_BASE_URL', 'NOTIFY', 'INSTAGRAM_CONFIG_ID', 'INSTAGRAM_LOGIN', 'DRAFTS_ONLY']);
 
 let cache: { at: number; values: Map<string, string> } | null = null;
 
@@ -29,6 +29,9 @@ function load(): Map<string, string> {
 }
 
 overrides.get = (key: string) => load().get(key);
+
+/** Drafts only (on unless the owner turned it off): nothing Publisher sends can go public by itself. */
+export const draftsOnly = () => overrides.get('DRAFTS_ONLY') !== 'off';
 
 export function saveSettings(values: Record<string, string | null>) {
 	const db = getDb();
@@ -61,6 +64,7 @@ export function setupView() {
 					redirectUri: redirectUri(p),
 					idLabel: f.idLabel,
 					secretLabel: f.secretLabel,
+					...(p === 'instagram' ? { loginMode: (saved.get('INSTAGRAM_CONFIG_ID') ?? process.env.INSTAGRAM_CONFIG_ID) ? 'unified' : (saved.get('INSTAGRAM_LOGIN') ?? process.env.INSTAGRAM_LOGIN) === 'facebook' ? 'facebook' : 'instagram', configPreview: (saved.get('INSTAGRAM_CONFIG_ID') ?? process.env.INSTAGRAM_CONFIG_ID) ? mask(saved.get('INSTAGRAM_CONFIG_ID') ?? process.env.INSTAGRAM_CONFIG_ID ?? '') : null } : {}),
 				}];
 			}),
 		),
@@ -77,7 +81,7 @@ export function checkKeys(p: Platform, id: string, secret: string): { field: str
 	if (/\s/.test(i) || /\s/.test(s)) out.push({ field: 'id', message: 'Remove spaces or line breaks from the pasted value.' });
 	if (p === 'youtube' && i && !i.endsWith('.apps.googleusercontent.com')) out.push({ field: 'id', message: 'A Google client ID ends in .apps.googleusercontent.com.' });
 	if (p === 'youtube' && i && s && s === i) out.push({ field: 'secret', message: 'This is the client ID again. Paste the client secret.' });
-	if (p === 'instagram' && i && !/^\d{6,}$/.test(i)) out.push({ field: 'id', message: 'The Instagram app ID is a number.' });
+	if (p === 'instagram' && i && !/^\d{6,}$/.test(i)) out.push({ field: 'id', message: 'The app ID is a number.' });
 	return out;
 }
 

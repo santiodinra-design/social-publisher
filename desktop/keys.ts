@@ -7,11 +7,27 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
 export type Keys = { sessionSecret: string; tokenKey: string };
+
+/**
+ * The async safeStorage API can answer "temporarily unavailable, please try again" while the
+ * Keychain is still starting up (seen right after a relaunch). Retry that for about 15 seconds
+ * before treating it as a real failure. Any other error is returned at once.
+ */
+async function withKeychain<T>(f: () => Promise<T>): Promise<T> {
+	for (let i = 0; ; i++) {
+		try {
+			return await f();
+		} catch (e: any) {
+			if (!/temporarily unavailable|try again/i.test(String(e?.message ?? e)) || i >= 20) throw e;
+			await new Promise((r) => setTimeout(r, 250 + i * 100));
+		}
+	}
+}
 type KeyFile = { v: 1; protectedBy: 'macOS Keychain (Electron safeStorage)'; sessionSecret: string; tokenKey: string; createdAt: string };
 
 export async function writeKeyFile(file: string, k: Keys) {
 	if (Buffer.from(k.tokenKey, 'base64').length !== 32) throw new Error('The encryption key must be 32 bytes.');
-	const enc = async (s: string) => (await safeStorage.encryptStringAsync(s)).toString('base64');
+	const enc = async (s: string) => (await withKeychain(() => safeStorage.encryptStringAsync(s))).toString('base64');
 	const body: KeyFile = { v: 1, protectedBy: 'macOS Keychain (Electron safeStorage)', sessionSecret: await enc(k.sessionSecret), tokenKey: await enc(k.tokenKey), createdAt: new Date().toISOString() };
 	fs.mkdirSync(path.dirname(file), { recursive: true });
 	const tmp = `${file}.tmp`;
@@ -23,7 +39,7 @@ export async function readKeyFile(file: string): Promise<Keys> {
 	const raw = JSON.parse(fs.readFileSync(file, 'utf8')) as KeyFile;
 	if (raw.v !== 1) throw new Error('Unknown key file version.');
 	const dec = async (s: string) => {
-		const r = await safeStorage.decryptStringAsync(Buffer.from(s, 'base64'));
+		const r = await withKeychain(() => safeStorage.decryptStringAsync(Buffer.from(s, 'base64')));
 		return typeof r === 'string' ? r : (r as any).result;
 	};
 	try {

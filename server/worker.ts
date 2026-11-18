@@ -4,7 +4,7 @@ import { assertSecrets } from './config.js';
 import { getDb, workerBeat } from './db.js';
 import './settings.js';
 import { randomId } from './crypto.js';
-import { cleanupMedia, tick } from './runner.js';
+import { cleanupMedia, setNoticeHandler, tick } from './runner.js';
 import { releaseLeases } from './jobs.js';
 
 assertSecrets();
@@ -40,6 +40,11 @@ process.on('SIGINT', () => stopNow('interrupted'));
 process.on('SIGTERM', () => stopNow('stopping'));
 parent?.on('message', (e) => e.data?.type === 'stop' && stopNow('app is quitting'));
 parent?.postMessage({ type: 'ready' });
+// Finished posts are announced by the desktop app (a macOS notification and the finish sound).
+setNoticeHandler((n) => {
+	console.log(`[notify] ${n.title} (${n.ok ? 'ok' : 'problem'})`);
+	parent?.postMessage({ type: 'notice', notice: n });
+});
 
 while (!stopping) {
 	try {

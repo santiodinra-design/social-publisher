@@ -42,8 +42,9 @@ export const tiktok: Adapter = {
 	},
 
 	authorizeUrl(state) {
-		const scopes = ['user.info.basic', 'video.upload', ...(config.tiktok.directPostEnabled ? ['video.publish'] : [])];
-		const q = new URLSearchParams({ client_key: config.tiktok.clientKey, scope: scopes.join(','), response_type: 'code', redirect_uri: redirectUri('tiktok'), state });
+		const scopes = ['user.info.basic', 'user.info.stats', 'video.list', 'video.upload', ...(config.tiktok.directPostEnabled ? ['video.publish'] : [])];
+		// disable_auto_auth=1: ask which TikTok account to use instead of silently reusing the signed-in one.
+		const q = new URLSearchParams({ client_key: config.tiktok.clientKey, scope: scopes.join(','), response_type: 'code', redirect_uri: redirectUri('tiktok'), state, disable_auto_auth: '1' });
 		return `https://www.tiktok.com/v2/auth/authorize/?${q}`;
 	},
 

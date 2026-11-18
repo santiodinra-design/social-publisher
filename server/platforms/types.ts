@@ -63,7 +63,8 @@ export type TokenSet = {
 	scopes?: string | null;
 };
 
-export type Identity = { externalId: string; displayName: string; handle?: string | null; avatarUrl?: string | null; meta?: Record<string, unknown> };
+/** `tokens`: this account's own token, when one sign-in yields a different token per account (Facebook Pages). */
+export type Identity = { externalId: string; displayName: string; handle?: string | null; avatarUrl?: string | null; meta?: Record<string, unknown>; tokens?: TokenSet };
 
 export type Outcome =
 	| { state: 'published'; permalink: string | null; remoteId?: string | null; message?: string }
@@ -102,6 +103,8 @@ export interface Adapter {
 	exchangeCode(code: string, pkceVerifier: string): Promise<TokenSet>;
 	refresh(account: AccountRow, refreshToken: string | null, accessToken: string | null): Promise<TokenSet>;
 	identity(accessToken: string, tokens: TokenSet): Promise<Identity>;
+	/** Platforms whose one sign-in can grant several accounts (Instagram Unified login). */
+	identities?(accessToken: string, tokens: TokenSet): Promise<Identity[]>;
 	revoke?(accessToken: string | null, refreshToken: string | null): Promise<void>;
 	/** Runs from the target's current phase. Throw TransientError, AuthError or PermanentError on failure. */
 	run(ctx: PublishContext): Promise<Outcome>;

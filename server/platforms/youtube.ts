@@ -4,6 +4,7 @@
 // videos.insert has its own quota bucket (100 calls a day by default).
 import fs from 'node:fs';
 import { config, redirectUri } from '../config.js';
+import * as covers from '../covers.js';
 import { isShortsShape } from '../media.js';
 import { form, http, json, classify } from './http.js';
 import type { Adapter, Outcome, PublishContext } from './types.js';
@@ -37,9 +38,10 @@ export const youtube: Adapter = {
 			client_id: config.youtube.clientId,
 			redirect_uri: redirectUri('youtube'),
 			response_type: 'code',
-			scope: 'https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube.readonly',
+			scope: 'https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube.readonly https://www.googleapis.com/auth/yt-analytics.readonly',
 			access_type: 'offline',
-			prompt: 'consent',
+			// Always show Google's account chooser, so a second channel can be added instead of reusing the signed-in one.
+			prompt: 'select_account consent',
 			include_granted_scopes: 'true',
 			state,
 			code_challenge: challenge,
@@ -148,6 +150,8 @@ export const youtube: Adapter = {
 			ctx.save({ remoteId: videoId, state: 'processing', phase: 'processing', progress: 1 });
 		}
 
+		await setThumbnail(ctx);
+
 		// Wait for YouTube to accept the upload before calling it published.
 		const id = ctx.target.remote_id!;
 		for (let i = 0; i < 180; i++) {
@@ -177,6 +181,43 @@ async function uploadOffset(ctx: PublishContext): Promise<{ offset: number; vide
 	if (res.status === 200 || res.status === 201) return { offset: ctx.media.size, videoId: (await res.json()).id };
 	if (res.status === 404) sessionGone(ctx);
 	throw classify(res.status, await res.json().catch(() => null), 'YouTube upload');
+}
+
+/**
+ * Sets the custom thumbnail the owner chose, once the video exists. Best effort: YouTube only allows
+ * custom thumbnails on verified channels, and a refused thumbnail must never fail a video that
+ * uploaded fine, so problems are recorded as events and YouTube keeps its own thumbnail.
+ */
+async function setThumbnail(ctx: PublishContext) {
+	const coverId = covers.chosen(ctx.settings);
+	const videoId = ctx.target.remote_id;
+	if (!coverId || !videoId || ctx.ref.thumbDone) return;
+	const done = (msg: string) => {
+		ctx.save({ providerRef: { ...ctx.ref, thumbDone: true } });
+		ctx.log(msg);
+	};
+	const cover = covers.get(coverId);
+	if (!cover) return done('The chosen thumbnail is no longer on this computer, so YouTube keeps its own.');
+	let bytes: Buffer;
+	try {
+		bytes = fs.readFileSync(cover.path);
+	} catch {
+		return done('Could not read the chosen thumbnail, so YouTube keeps its own.');
+	}
+	let token: string;
+	try {
+		token = await ctx.token();
+	} catch {
+		return;
+	}
+	try {
+		await json(`https://www.googleapis.com/upload/youtube/v3/thumbnails/set?videoId=${encodeURIComponent(videoId)}&uploadType=media`, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': cover.mime }, body: new Uint8Array(bytes), timeoutMs: 120_000 });
+		done('Custom thumbnail set.');
+	} catch (e: any) {
+		// A network problem is worth another try on the next attempt; anything else is final.
+		if (e instanceof TransientError) ctx.log(`Thumbnail not set yet: ${e.message}`);
+		else done(`YouTube did not accept the thumbnail (${e?.message ?? e}). Custom thumbnails need a verified channel: youtube.com/verify.`);
+	}
 }
 
 /** The resumable session no longer exists. Restarting is only safe if the final part was never sent. */

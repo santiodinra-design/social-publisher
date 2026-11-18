@@ -9,5 +9,6 @@ contextBridge.exposeInMainWorld('publisher', {
 	},
 	openExternal: (url: string) => ipcRenderer.invoke('open-external', String(url)),
 	revealLogs: () => ipcRenderer.invoke('reveal-logs'),
+	revealInbox: () => ipcRenderer.invoke('reveal-inbox'),
 	services: () => ipcRenderer.invoke('services'),
 });

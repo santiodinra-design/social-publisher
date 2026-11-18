@@ -11,13 +11,31 @@ import { config, configured } from './config.js';
 import { getDb, now, workerStatus, type Platform } from './db.js';
 import { pkcePair, randomId, readSignedToken, redact, signedToken } from './crypto.js';
 import { accessToken, disconnect, getAccount, listAccounts, markAccount, upsertAccount } from './accounts.js';
-import { createPost, listPosts, PLATFORM_LABEL, postView, retryTargets } from './jobs.js';
+import { cancelScheduled, createPost, listPosts, markPosted, PLATFORM_LABEL, postView, reschedule, retryTargets, tiktokLink, validScheduleTime } from './jobs.js';
+import * as covers from './covers.js';
+import { report } from './analytics.js';
+import { clean as cleanGroup, createGroup, deleteGroup, listGroups, updateGroup } from './groups.js';
+import { enabled as notifyEnabled } from './notify.js';
 import { LIMITS, isShortsShape, probe, validateMedia, VIDEO_MIME, type Issue } from './media.js';
 import { ADAPTERS, adapterFor, PLATFORMS } from './platforms/index.js';
-import { checkKeys, FIELDS, saveSettings, setupView } from './settings.js';
+import { checkKeys, draftsOnly, FIELDS, saveSettings, setupView } from './settings.js';
+import { inboxStatus } from './inbox.js';
 import type { MediaRow } from './platforms/types.js';
 import { AuthError } from './platforms/types.js';
 
+/** Extras shared with the Windows build that the Node server provides too. */
+const FEATURES = ['schedule', 'markPosted', 'repost', 'covers', 'analytics', 'groups', 'draftsOnly'];
+
+/**
+ * Drafts only: TikTok always goes to the inbox (the owner finishes it in TikTok) and Instagram, which
+ * has no drafts in its API, is refused. YouTube keeps the visibility the owner chose.
+ */
+export function asDraft(platform: Platform, s: Record<string, unknown>): Record<string, unknown> | null {
+	if (platform === 'youtube') return s;
+	if (platform === 'tiktok') return { ...s, mode: 'inbox', privacy: 'SELF_ONLY' };
+	return null;
+}
+export const DRAFTS_INSTAGRAM = 'Drafts only is on, and Instagram has no drafts for apps. Post this Reel from the Instagram app, or turn off Drafts only.';
 const SESSION = 'sp_session';
 const DESKTOP = 'sp_desktop';
 const OAUTH = 'sp_oauth';
@@ -32,6 +50,8 @@ export async function buildApp(opts: { logger?: boolean } = {}) {
 	});
 	await app.register(cookie, { secret: config.sessionSecret });
 	app.addContentTypeParser(['application/octet-stream', ...VIDEO_MIME], (_req, payload, done) => done(null, payload));
+	// Cover images arrive as raw JPEG/PNG bytes (checked again by their first bytes in covers.ts).
+	app.addContentTypeParser(['image/jpeg', 'image/png'], { parseAs: 'buffer', bodyLimit: covers.MAX_BYTES + 1024 }, (_req, body, done) => done(null, body));
 
 	const secure = config.appUrl.startsWith('https');
 	const desktopOk = (req: FastifyRequest) => {
@@ -50,6 +70,22 @@ export async function buildApp(opts: { logger?: boolean } = {}) {
 		// Simple CSRF guard: state-changing API calls must come from this app.
 		if (!open && !['GET', 'HEAD'].includes(req.method) && req.headers['x-requested-with'] !== 'social-publisher') return reply.code(403).send({ error: 'Blocked request.' });
 	});
+
+	// ---------- Terms and Privacy pages (public; platform developer consoles ask for these links) ----------
+	const page = (title: string, body: string) =>
+		`<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Publisher · ${title}</title><style>body{font:16px/1.6 -apple-system,system-ui,sans-serif;max-width:680px;margin:40px auto;padding:0 20px;color:#ddd;background:#16161a}h1{font-size:24px}h2{font-size:17px;margin-top:28px}</style><h1>${title}</h1>${body}<p style="color:#888;margin-top:32px">Last updated 16 November 2026</p></html>`;
+	app.get('/terms', async (_req, reply) =>
+		reply.type('text/html').send(page('Terms of Service', `
+<p>Publisher is a private, single-user tool. Its owner uses it to upload their own videos to their own YouTube, Instagram and TikTok accounts. It is not offered to the public.</p>
+<h2>Use</h2><p>Only the owner may use Publisher, and only with accounts they own or are allowed to manage. Each post is started by the owner. Publisher never posts on its own.</p>
+<h2>Platforms</h2><p>Using Publisher with YouTube, Instagram or TikTok is also subject to those platforms' own terms and community guidelines. The owner is responsible for the content they post, including having the rights to any music.</p>
+<h2>No warranty</h2><p>Publisher is provided as is, without any warranty.</p>`)));
+	app.get('/privacy', async (_req, reply) =>
+		reply.type('text/html').send(page('Privacy Policy', `
+<p>Publisher is a private tool that runs on its owner's own computer. It has no other users and no servers of its own.</p>
+<h2>What it stores</h2><p>When the owner connects an account, Publisher stores the sign-in token and basic profile details (name, handle, avatar) on the owner's computer, encrypted with a key protected by the macOS Keychain. It also keeps the owner's videos, captions and post history there.</p>
+<h2>How it is used</h2><p>This data is used only to upload the owner's videos and to show their own post statistics. Publisher has no ads or analytics trackers, and it does not sell or share data with anyone except the platform a video is being posted to.</p>
+<h2>Deleting data</h2><p>Disconnecting an account in Publisher deletes its token. Access can also be removed at any time in the platform's own app settings. Uploaded video copies are deleted automatically after a few days.</p>`)));
 
 	// ---------- session ----------
 	const tries = new Map<string, { n: number; at: number }>();
@@ -85,6 +121,9 @@ export async function buildApp(opts: { logger?: boolean } = {}) {
 	app.get('/api/config', async () => ({
 		demoMode: config.demoMode,
 		publicBaseUrl: Boolean(config.publicBaseUrl),
+		// Extras shared with the Windows build. The UI shows a feature only when it is listed here.
+		features: [...FEATURES, ...(config.desktop ? ['notifications', 'inbox'] : [])],
+		draftsOnly: draftsOnly(),
 		platforms: Object.fromEntries(PLATFORMS.map((p) => [p, { configured: configured[p](), ...ADAPTERS[p].availability(), limits: LIMITS[p] }])),
 	}));
 
@@ -93,13 +132,19 @@ export async function buildApp(opts: { logger?: boolean } = {}) {
 	app.put('/api/setup/:platform', async (req, reply) => {
 		const platform = (req.params as any).platform as Platform;
 		if (!PLATFORMS.includes(platform)) return reply.code(404).send({ error: 'Unknown platform' });
-		const b = z.object({ id: z.string().max(300).default(''), secret: z.string().max(300).default(''), publicBaseUrl: z.string().max(300).optional() }).safeParse(req.body ?? {});
+		const b = z.object({ id: z.string().max(300).default(''), secret: z.string().max(300).default(''), publicBaseUrl: z.string().max(300).optional(), configId: z.string().max(60).optional(), loginMode: z.enum(['unified', 'facebook', 'instagram']).optional() }).safeParse(req.body ?? {});
 		if (!b.success) return reply.code(400).send({ error: 'Check the fields.' });
 		const issues = checkKeys(platform, b.data.id, b.data.secret);
 		if (b.data.publicBaseUrl && !/^https:\/\/[^\s/]+(\/.*)?$/.test(b.data.publicBaseUrl.trim())) issues.push({ field: 'publicBaseUrl', message: 'Use the full https:// address of your tunnel.' });
+		const igMode = platform === 'instagram' ? (b.data.loginMode ?? (b.data.configId?.trim() ? 'unified' : undefined)) : undefined;
+		if (igMode === 'unified' && !b.data.configId?.trim() && !config.instagram.configId) issues.push({ field: 'configId', message: 'Paste the Configuration ID from your Unified login configuration.' });
+		if (platform === 'instagram' && b.data.configId?.trim() && !/^\d{6,}$/.test(b.data.configId.trim())) issues.push({ field: 'configId', message: 'The configuration ID is a number.' });
 		if (issues.length) return reply.code(422).send({ error: 'Check the highlighted fields.', issues });
 		const f = FIELDS[platform];
-		saveSettings({ [f.id]: b.data.id.trim(), [f.secret]: b.data.secret.trim(), ...(b.data.publicBaseUrl !== undefined ? { PUBLIC_BASE_URL: b.data.publicBaseUrl.trim().replace(/\/$/, '') } : {}) });
+		saveSettings({ [f.id]: b.data.id.trim(), [f.secret]: b.data.secret.trim(), ...(b.data.publicBaseUrl !== undefined ? { PUBLIC_BASE_URL: b.data.publicBaseUrl.trim().replace(/\/$/, '') } : {}), ...(platform === 'instagram' && b.data.configId?.trim() && igMode === 'unified' ? { INSTAGRAM_CONFIG_ID: b.data.configId.trim() } : {}),
+			// The connection type decides the sign-in: only Unified login keeps a configuration ID.
+			...(igMode && igMode !== 'unified' ? { INSTAGRAM_CONFIG_ID: null, INSTAGRAM_LOGIN: igMode === 'facebook' ? 'facebook' : null } : {}),
+			...(igMode === 'unified' ? { INSTAGRAM_LOGIN: null } : {}) });
 		return setupView();
 	});
 	app.delete('/api/setup/:platform', async (req, reply) => {
@@ -190,15 +235,21 @@ export async function buildApp(opts: { logger?: boolean } = {}) {
 				? reply.type('text/html; charset=utf-8').header('Cache-Control', 'no-store').send(callbackPage(ok, msg))
 				: reply.redirect(`${config.appUrl}/accounts?${ok ? 'connected' : 'error'}=${encodeURIComponent(msg)}`);
 		const fail = (msg: string) => done(false, msg);
+		if (q.error === 'access_denied' || q.error_reason === 'user_denied')
+			return fail(
+				platform === 'youtube'
+					? 'Google cancelled the sign-in. Try Connect again: on "Google hasn\'t verified this app" click Continue (not Back to safety), then tick every permission box and click Continue. The Google account must also be a Test user on your consent screen while the app is in Testing.'
+					: `${PLATFORM_LABEL[platform] ?? platform} cancelled the sign-in. Try Connect again and allow every permission it asks for. While your developer app is in testing, this account must be added as a tester there.`,
+			);
 		if (q.error) return fail(`${platform}: ${q.error_description || q.error_reason || q.error}`);
 		if (!saved || saved.platform !== platform || saved.exp < now()) return fail('The sign-in link expired or did not match. Please try connecting again from the app.');
 		if (!q.code) return fail('The platform did not return an authorization code.');
 		try {
 			const adapter = ADAPTERS[platform];
 			const tokens = await adapter.exchangeCode(q.code, saved.verifier);
-			const id = await adapter.identity(tokens.accessToken, tokens);
-			const acct = upsertAccount(platform, id, tokens);
-			return done(true, acct.display_name);
+			const ids = adapter.identities ? await adapter.identities(tokens.accessToken, tokens) : [await adapter.identity(tokens.accessToken, tokens)];
+			const names = ids.map((id) => upsertAccount(platform, id, id.tokens ?? tokens).display_name);
+			return done(true, names.join(', '));
 		} catch (e: any) {
 			req.log?.warn({ platform }, 'oauth exchange failed');
 			return fail(`Could not connect ${platform}: ${redact(e?.message ?? String(e))}`);
@@ -261,7 +312,14 @@ export async function buildApp(opts: { logger?: boolean } = {}) {
 
 	// ---------- posts ----------
 	const targetSchema = z.object({ accountId: z.string().min(1), settings: z.record(z.string(), z.any()).default({}) });
-	const postSchema = z.object({ idempotencyKey: z.string().min(8).max(100), mediaId: z.string().min(1), caption: z.string().max(5000).default(''), targets: z.array(targetSchema).min(1, 'Choose at least one destination.') });
+	const scheduleMsg = 'Pick a time at least a minute from now and within 60 days.';
+	const postSchema = z.object({
+		idempotencyKey: z.string().min(8).max(100),
+		mediaId: z.string().min(1),
+		caption: z.string().max(5000).default(''),
+		targets: z.array(targetSchema).min(1, 'Choose at least one destination.'),
+		scheduledAt: z.number().nullish().refine((v) => v == null || validScheduleTime(v), scheduleMsg),
+	});
 
 	app.post('/api/posts', async (req, reply) => {
 		const parsed = postSchema.safeParse(req.body);
@@ -287,17 +345,26 @@ export async function buildApp(opts: { logger?: boolean } = {}) {
 			if (demo === null) demo = Boolean(a.is_demo);
 			if (demo !== Boolean(a.is_demo)) issues.push({ field: `target.${a.id}`, message: 'Demo accounts and real accounts cannot be in the same post.' });
 			if (a.status === 'reconnect_required') issues.push({ field: `target.${a.id}`, message: `Reconnect ${a.display_name} before publishing.` });
+			let settings = t.settings;
+			if (draftsOnly()) {
+				const d = asDraft(a.platform, settings);
+				if (!d) {
+					issues.push({ field: `target.${a.id}`, message: DRAFTS_INSTAGRAM });
+					continue;
+				}
+				settings = d;
+			}
 			const adapter = adapterFor(a.platform, Boolean(a.is_demo));
 			const av = adapter.availability();
 			if (!av.available) issues.push({ field: `target.${a.id}`, message: av.note });
-			const caption = String(t.settings.captionOverride ?? '').trim() || body.caption;
-			for (const i of [...validateMedia(a.platform, { ...mediaInfo(media), mime: media.mime, filename: media.filename }), ...adapter.validateSettings(t.settings, caption, mediaInfo(media))]) {
+			const caption = String(settings.captionOverride ?? '').trim() || body.caption;
+			for (const i of [...validateMedia(a.platform, { ...mediaInfo(media), mime: media.mime, filename: media.filename }), ...adapter.validateSettings(settings, caption, mediaInfo(media)), ...covers.issues(a.platform, settings)]) {
 				issues.push({ field: i.field === 'media' ? `media.${a.platform}` : i.field, message: i.message });
 			}
-			targets.push({ accountId: a.id, platform: a.platform, settings: t.settings });
+			targets.push({ accountId: a.id, platform: a.platform, settings });
 		}
 		if (issues.length) return reply.code(422).send({ error: 'Fix the highlighted fields before publishing.', issues });
-		const r = createPost({ idempotencyKey: body.idempotencyKey, mediaId: media.id, caption: body.caption, isDemo: Boolean(demo), targets });
+		const r = createPost({ idempotencyKey: body.idempotencyKey, mediaId: media.id, caption: body.caption, isDemo: Boolean(demo), targets, scheduledAt: body.scheduledAt ?? null });
 		return { post: postView(r.id), duplicate: r.duplicate };
 	});
 
@@ -309,6 +376,79 @@ export async function buildApp(opts: { logger?: boolean } = {}) {
 		if (!ids.length) return reply.code(409).send({ error: 'Nothing to retry. Only failed destinations can be retried.' });
 		return { retried: ids, post: postView((req.params as any).id) };
 	});
+
+	app.post('/api/posts/:id/schedule', async (req, reply) => {
+		const at = (req.body as any)?.at ?? null;
+		if (at !== null && !validScheduleTime(at)) return reply.code(422).send({ error: scheduleMsg, issues: [{ field: 'scheduledAt', message: scheduleMsg }] });
+		if (!reschedule((req.params as any).id, at)) return reply.code(409).send({ error: 'This post has already started publishing, so its time cannot change.' });
+		return { post: postView((req.params as any).id) };
+	});
+	app.post('/api/posts/:id/cancel', async (req, reply) => {
+		if (!cancelScheduled((req.params as any).id)) return reply.code(409).send({ error: 'Nothing to cancel. Only destinations still waiting for their time can be cancelled.' });
+		return { post: postView((req.params as any).id) };
+	});
+	app.post('/api/targets/:id/posted', async (req, reply) => {
+		const link = tiktokLink(String((req.body as any)?.permalink ?? ''));
+		if (!link.ok) return reply.code(422).send({ error: link.message, issues: [{ field: 'permalink', message: link.message }] });
+		try {
+			return { post: postView(markPosted((req.params as any).id, link.link)) };
+		} catch (e: any) {
+			return reply.code(e.message === 'Not found' ? 404 : 409).send({ error: e.message });
+		}
+	});
+
+	// ---------- cover images ----------
+	app.put('/api/covers', { bodyLimit: covers.MAX_BYTES + 1024 }, async (req, reply) => {
+		let body = req.body as any;
+		if (body && typeof body.pipe === 'function') {
+			const chunks: Buffer[] = [];
+			let n = 0;
+			for await (const c of body as AsyncIterable<Buffer>) {
+				n += c.length;
+				if (n > covers.MAX_BYTES) return reply.code(422).send({ error: 'Cover images can be up to 8 MB.' });
+				chunks.push(c);
+			}
+			body = Buffer.concat(chunks);
+		}
+		const r = covers.save(Buffer.isBuffer(body) ? body : Buffer.alloc(0));
+		return r.ok ? r.view : reply.code(422).send({ error: r.message });
+	});
+	app.get('/api/covers/:id', async (req, reply) => {
+		const m = covers.get((req.params as any).id);
+		return m ? sendFile(req, reply, m) : reply.code(404).send('Not found');
+	});
+
+	// ---------- saved account groups ----------
+	app.get('/api/groups', async () => listGroups());
+	app.post('/api/groups', async (req, reply) => {
+		const c = cleanGroup((req.body as any)?.name, (req.body as any)?.accountIds);
+		return c.ok ? createGroup(c.name, c.ids) : reply.code(422).send({ error: c.message });
+	});
+	app.put('/api/groups/:id', async (req, reply) => {
+		const c = cleanGroup((req.body as any)?.name, (req.body as any)?.accountIds);
+		if (!c.ok) return reply.code(422).send({ error: c.message });
+		return updateGroup((req.params as any).id, c.name, c.ids) ? listGroups() : reply.code(404).send({ error: 'Not found' });
+	});
+	app.delete('/api/groups/:id', async (req, reply) => (deleteGroup((req.params as any).id) ? listGroups() : reply.code(404).send({ error: 'Not found' })));
+
+	// ---------- stats ----------
+	app.get('/api/analytics', async (req) => {
+		const q = req.query as Record<string, string | undefined>;
+		return report(Number(q.days ?? 28), q.account || undefined, q.fresh === '1');
+	});
+
+	// ---------- desktop preferences ----------
+	const prefs = () => ({ notifications: notifyEnabled(), draftsOnly: draftsOnly() });
+	app.get('/api/desktop/prefs', async () => prefs());
+	app.put('/api/desktop/prefs', async (req) => {
+		const b = (req.body as any) ?? {};
+		if (typeof b.notifications === 'boolean') saveSettings({ NOTIFY: b.notifications ? null : 'off' });
+		if (typeof b.draftsOnly === 'boolean') saveSettings({ DRAFTS_ONLY: b.draftsOnly ? null : 'off' });
+		return prefs();
+	});
+
+	// ---------- inbox folder (videos dropped by the owner's Claude sessions) ----------
+	app.get('/api/inbox', async () => inboxStatus());
 
 	// ---------- built UI ----------
 	const dist = config.uiDist;
@@ -342,6 +482,7 @@ function mediaView(m: MediaRow) {
 		height: m.height,
 		videoCodec: m.video_codec,
 		audioCodec: m.audio_codec,
+		fps: m.fps,
 		shortsShape: isShortsShape(m),
 		issues: Object.fromEntries(PLATFORMS.map((p) => [p, validateMedia(p, { ...mediaInfo(m), mime: m.mime, filename: m.filename }).map((i) => i.message)])),
 	};

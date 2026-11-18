@@ -34,3 +34,7 @@ data/
 # Desktop build output
 dist-desktop/
 release/
+
+# Windows (Rust) build output
+windows/target/
+windows/app/gen/

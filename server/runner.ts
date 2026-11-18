@@ -1,13 +1,24 @@
 import fs from 'node:fs';
-import { getDb, now } from './db.js';
+import { getDb, now, TERMINAL } from './db.js';
 import { accessToken, getAccount, markAccount } from './accounts.js';
 import { addEvent, claimNext, finish, getTarget, heartbeat, patchTarget, scheduleRetry, unknownOutcomeMessage } from './jobs.js';
 import { adapterFor } from './platforms/index.js';
 import type { MediaRow, Outcome, PublishContext, TargetRow } from './platforms/types.js';
 import { AttentionError, AuthError, MissingMediaError, PermanentError, RejectedError, TransientError } from './platforms/types.js';
 import { config } from './config.js';
+import { afterTarget, type Notice } from './notify.js';
 
 export type RunnerOptions = { sleep?: (ms: number) => Promise<void> };
+
+/** The worker sets this to pass finish notices to the desktop app. */
+let onNotice: ((n: Notice) => void) | null = null;
+export const setNoticeHandler = (f: ((n: Notice) => void) | null) => (onNotice = f);
+function announce(postId: string) {
+	try {
+		const n = afterTarget(postId);
+		if (n && onNotice) onNotice(n);
+	} catch {}
+}
 
 /** Runs one claimed target to its next stable state. Exported for tests. */
 export async function runTarget(t: TargetRow, owner: string, opts: RunnerOptions = {}) {
@@ -95,6 +106,8 @@ export async function runTarget(t: TargetRow, owner: string, opts: RunnerOptions
 		}
 	} finally {
 		clearInterval(beat);
+		const end = getTarget(t.id);
+		if (end && TERMINAL.includes(end.state)) announce(t.post_id);
 	}
 }
 
@@ -121,7 +134,8 @@ export function cleanupMedia() {
 	const cutoff = now() - config.mediaRetentionHours * 3_600_000;
 	const rows = db
 		.prepare(`SELECT m.id, m.path FROM media m WHERE m.deleted_at IS NULL AND m.created_at < ?
-			AND NOT EXISTS (SELECT 1 FROM posts p JOIN targets t ON t.post_id = p.id WHERE p.media_id = m.id AND t.state IN ('queued','uploading','processing'))`)
+			AND NOT EXISTS (SELECT 1 FROM posts p JOIN targets t ON t.post_id = p.id WHERE p.media_id = m.id AND t.state IN ('queued','uploading','processing'))
+			AND NOT EXISTS (SELECT 1 FROM targets t WHERE t.state IN ('queued','uploading','processing') AND t.settings LIKE '%"coverId":"' || m.id || '"%')`)
 		.all(cutoff) as { id: string; path: string }[];
 	for (const r of rows) {
 		try {
