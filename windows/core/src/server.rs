@@ -14,7 +14,7 @@ use crate::settings::{self, check_keys, fields, setup_view};
 use crate::util::{decode_component, encode_component, js_str, now_ms};
 use crate::{probe, relay, App};
 use axum::body::{Body, Bytes};
-use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -32,8 +32,24 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 const DESKTOP_COOKIE: &str = "sp_desktop";
 /// What this backend can do beyond the original contract. The shared UI shows a feature only when it
 /// is listed here, so the Mac app (whose server sends none) keeps its screens unchanged.
-const FEATURES: &[&str] = &["schedule", "notifications", "markPosted", "repost", "covers", "analytics"];
-const SIGN_IN_HOSTS: [&str; 4] = ["accounts.google.com", "www.instagram.com", "api.instagram.com", "www.tiktok.com"];
+const FEATURES: &[&str] = &["schedule", "notifications", "markPosted", "repost", "covers", "analytics", "groups", "draftsOnly", "inbox", "phone"];
+const SIGN_IN_HOSTS: [&str; 5] = ["accounts.google.com", "www.instagram.com", "api.instagram.com", "www.tiktok.com", "www.facebook.com"];
+
+/// Drafts only: TikTok always goes to the inbox (the owner finishes it in TikTok) and Instagram, which
+/// has no drafts in its API, is refused. YouTube keeps the visibility the owner chose.
+pub fn as_draft(platform: Platform, settings: &Value) -> Option<Value> {
+	match platform {
+		Platform::Youtube => Some(settings.clone()),
+		Platform::Tiktok => {
+			let mut s = if settings.is_object() { settings.clone() } else { json!({}) };
+			s["mode"] = Value::from("inbox");
+			s["privacy"] = Value::from("SELF_ONLY");
+			Some(s)
+		}
+		Platform::Instagram => None,
+	}
+}
+pub const DRAFTS_INSTAGRAM: &str = "Drafts only is on, and Instagram has no drafts for apps. Post this Reel from the Instagram app, or turn off Drafts only.";
 
 #[derive(rust_embed::RustEmbed)]
 #[folder = "../../dist"]
@@ -76,6 +92,16 @@ pub fn router(app: Arc<App>) -> Router {
 		.route("/api/desktop/open-link", post(desktop_open_link))
 		.route("/api/desktop/reveal-logs", post(desktop_reveal_logs))
 		.route("/api/desktop/prefs", get(desktop_prefs).put(desktop_prefs_put))
+		.route("/api/desktop/reveal-inbox", post(desktop_reveal_inbox))
+		.route("/api/groups", get(groups_list).post(groups_create))
+		.route("/api/groups/{id}", put(groups_update).delete(groups_delete))
+		.route("/api/inbox", get(inbox_get))
+		.route("/api/phone", get(phone_get).put(phone_put))
+		.route("/api/phone/pair", post(phone_pair))
+		.route("/api/phone/devices/{id}", delete(phone_remove))
+		.route("/pair/{secret}", get(phone_redeem))
+		.route("/terms", get(terms_page))
+		.route("/privacy", get(privacy_page))
 		.fallback(static_ui)
 		.layer(DefaultBodyLimit::max(1024 * 1024))
 		.layer(middleware::from_fn_with_state(app.clone(), guard))
@@ -131,18 +157,38 @@ fn desktop_ok(app: &App, headers: &HeaderMap) -> bool {
 	!want.is_empty() && constant_eq(got.as_bytes(), want.as_bytes())
 }
 fn is_open(path: &str) -> bool {
-	if path == "/api/session" || path == "/api/desktop/enter" || path.starts_with("/m/") || !path.starts_with("/api/") {
+	if path == "/api/session" || path == "/api/desktop/enter" || path.starts_with("/m/") || path.starts_with("/pair/") || !path.starts_with("/api/") {
 		return true;
 	}
 	// /api/oauth/<platform>/callback
 	path.strip_prefix("/api/oauth/").and_then(|r| r.strip_suffix("/callback")).map(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_lowercase())).unwrap_or(false)
 }
 
+/** The paired phone behind a request, unless it is the app window itself. */
+fn phone_of(app: &App, headers: &HeaderMap) -> Option<String> {
+	if desktop_ok(app, headers) {
+		None
+	} else {
+		crate::phone::device_of(app, cookie(headers, crate::phone::COOKIE))
+	}
+}
+
 async fn guard(State(app): S, req: Request, next: Next) -> Response {
 	let path = req.uri().path();
+	// Requests that come straight from the inbox folder carry no peer address; they are this process.
+	let local = req.extensions().get::<ConnectInfo<std::net::SocketAddr>>().map(|c| c.0.ip().is_loopback()).unwrap_or(true);
+	// The window's one-use entry link only ever comes from this computer.
+	if path == "/api/desktop/enter" && !local {
+		return fail(403, "Blocked request.");
+	}
 	if !is_open(path) {
-		if !desktop_ok(&app, req.headers()) {
+		let desktop = desktop_ok(&app, req.headers());
+		let phone = if desktop { None } else { crate::phone::device_of(&app, cookie(req.headers(), crate::phone::COOKIE)) };
+		if !desktop && phone.is_none() {
 			return fail(401, "Sign in first.");
+		}
+		if phone.is_some() && crate::phone::blocked(req.method(), path) {
+			return fail(403, "Do this in Publisher on the computer.");
 		}
 		// Simple CSRF guard: state-changing API calls must come from this app.
 		let safe = matches!(*req.method(), Method::GET | Method::HEAD);
@@ -161,14 +207,26 @@ fn platform_of(p: &str) -> Result<Platform, Response> {
 
 // ---------- session, status, config ----------
 
+/// `desktop`: the app window. `phone`: a paired phone (it gets the web screens, without the native
+/// bridge). `phonePairing`: a phone that is not paired yet is told how to pair instead of a password.
 async fn session(State(app): S, headers: HeaderMap) -> Response {
-	ok(json!({ "signedIn": desktop_ok(&app, &headers), "demoMode": app.cfg.demo_mode, "noSignIn": false, "desktop": true }))
+	let desktop = desktop_ok(&app, &headers);
+	let phone = phone_of(&app, &headers).is_some();
+	ok(json!({ "signedIn": desktop || phone, "demoMode": app.cfg.demo_mode, "noSignIn": false, "desktop": !phone, "phone": phone, "phonePairing": crate::phone::enabled(&app) }))
 }
 async fn session_post() -> Response {
 	fail(403, "This server belongs to the Publisher desktop app. Open the app instead.")
 }
-async fn session_delete() -> Response {
-	ok(json!({ "ok": true }))
+/** A paired phone signing out forgets itself, so it needs a new QR code to come back. */
+async fn session_delete(State(app): S, headers: HeaderMap) -> Response {
+	let mut res = ok(json!({ "ok": true }));
+	if let Some(id) = phone_of(&app, &headers) {
+		crate::phone::remove(&app, &id);
+		if let Ok(v) = HeaderValue::from_str(&crate::phone::clear_cookie()) {
+			res.headers_mut().insert(header::SET_COOKIE, v);
+		}
+	}
+	res
 }
 
 /** Worker health comes from the worker's own heartbeat, not from this server answering. */
@@ -185,7 +243,7 @@ async fn config(State(app): S) -> Response {
 		})
 		.collect();
 	let video_hosting = relay::base(&app).is_some() && app.endpoints.relay_platforms.contains(&Platform::Instagram);
-	ok(json!({ "demoMode": app.cfg.demo_mode, "publicBaseUrl": !settings::public_base_url(&app).is_empty(), "videoHosting": video_hosting, "features": FEATURES, "platforms": platforms }))
+	ok(json!({ "demoMode": app.cfg.demo_mode, "publicBaseUrl": !settings::public_base_url(&app).is_empty(), "videoHosting": video_hosting, "features": FEATURES, "draftsOnly": settings::drafts_only(&app), "platforms": platforms }))
 }
 
 // ---------- platform app keys (entered in the app) ----------
@@ -222,11 +280,29 @@ async fn setup_put(State(app): S, Path(platform): Path<String>, body: Bytes) -> 
 		Value::String(s) if s.encode_utf16().count() <= 300 => Some(s.trim().to_string()),
 		_ => return fail(400, "Check the fields."),
 	};
+	// Instagram only: how it signs in, and the Unified login configuration ID.
+	let config_id = match &b["configId"] {
+		Value::Null => String::new(),
+		Value::String(s) if s.encode_utf16().count() <= 60 => s.trim().to_string(),
+		_ => return fail(400, "Check the fields."),
+	};
+	let login = match &b["loginMode"] {
+		Value::Null => None,
+		Value::String(s) if matches!(s.as_str(), "unified" | "facebook" | "instagram") => Some(s.clone()),
+		_ => return fail(400, "Check the fields."),
+	};
+	let ig_mode = (p == Platform::Instagram).then(|| login.clone().or_else(|| (!config_id.is_empty()).then(|| "unified".to_string()))).flatten();
 	let mut issues = check_keys(p, &id, &secret);
 	if let Some(u) = public.as_deref().filter(|u| !u.is_empty()) {
 		if !valid_public_url(u) {
 			issues.push(Issue::new("publicBaseUrl", PUBLIC_URL_HINT));
 		}
+	}
+	if ig_mode.as_deref() == Some("unified") && config_id.is_empty() && settings::get(&app, "INSTAGRAM_CONFIG_ID").is_empty() {
+		issues.push(Issue::new("configId", "Paste the Configuration ID from your Unified login configuration."));
+	}
+	if p == Platform::Instagram && !config_id.is_empty() && !(config_id.len() >= 6 && config_id.bytes().all(|b| b.is_ascii_digit())) {
+		issues.push(Issue::new("configId", "The configuration ID is a number."));
 	}
 	if !issues.is_empty() {
 		return fail_with(422, "Check the highlighted fields.", &issues);
@@ -236,6 +312,20 @@ async fn setup_put(State(app): S, Path(platform): Path<String>, body: Bytes) -> 
 	let mut values: Vec<(&str, Option<&str>)> = vec![(f.id, Some(id.trim())), (f.secret, Some(secret.trim()))];
 	if let Some(u) = &trimmed_public {
 		values.push(("PUBLIC_BASE_URL", Some(u.as_str())));
+	}
+	// The connection type decides the sign-in: only Unified login keeps a configuration ID.
+	match ig_mode.as_deref() {
+		Some("unified") => {
+			if !config_id.is_empty() {
+				values.push(("INSTAGRAM_CONFIG_ID", Some(config_id.as_str())));
+			}
+			values.push(("INSTAGRAM_LOGIN", None));
+		}
+		Some(mode) => {
+			values.push(("INSTAGRAM_CONFIG_ID", None));
+			values.push(("INSTAGRAM_LOGIN", (mode == "facebook").then_some("facebook")));
+		}
+		None => {}
 	}
 	match settings::save(&app, &values) {
 		Ok(()) => ok(setup_view(&app)),
@@ -372,6 +462,16 @@ async fn oauth_callback(State(app): S, Path(platform): Path<String>, Query(q): Q
 	// The callback opens in the system browser, so answer with a small page there.
 	let done = |good: bool, msg: &str| html(callback_page(good, msg));
 	let param = |k: &str| q.get(k).filter(|v| !v.is_empty());
+	if param("error").map(String::as_str) == Some("access_denied") || param("error_reason").map(String::as_str) == Some("user_denied") {
+		return done(
+			false,
+			&if p == Platform::Youtube {
+				"Google cancelled the sign-in. Try Connect again: on \"Google hasn't verified this app\" click Continue (not Back to safety), then tick every permission box and click Continue. The Google account must also be a Test user on your consent screen while the app is in Testing.".to_string()
+			} else {
+				format!("{} cancelled the sign-in. Try Connect again and allow every permission it asks for. While your developer app is in testing, this account must be added as a tester there.", p.label())
+			},
+		);
+	}
 	if let Some(e) = param("error") {
 		let detail = param("error_description").or(param("error_reason")).unwrap_or(e);
 		return done(false, &format!("{platform}: {detail}"));
@@ -382,11 +482,16 @@ async fn oauth_callback(State(app): S, Path(platform): Path<String>, Query(q): Q
 	let Some(code) = param("code") else { return done(false, "The platform did not return an authorization code.") };
 	let connect = async {
 		let tokens = platforms::exchange_code(&app, p, code, &saved.verifier, saved.via_relay).await?;
-		let mut who = platforms::identity(&app, p, &tokens.access_token, &tokens).await?;
-		if saved.via_relay {
-			who.meta = Some(relay::mark(who.meta.take()));
+		// One sign-in can share several accounts (Instagram through Facebook); all of them are connected.
+		let mut names = Vec::new();
+		for mut who in platforms::identities(&app, p, &tokens.access_token, &tokens).await? {
+			if saved.via_relay {
+				who.meta = Some(relay::mark(who.meta.take()));
+			}
+			let own = who.tokens.clone().unwrap_or_else(|| tokens.clone());
+			names.push(upsert_account(&app, p, &who, &own, false).map(|a| a.display_name).unwrap_or(who.display_name));
 		}
-		Ok::<_, platforms::PubError>(upsert_account(&app, p, &who, &tokens, false).map(|a| a.display_name).unwrap_or(who.display_name))
+		Ok::<_, platforms::PubError>(names.join(", "))
 	};
 	match connect.await {
 		Ok(name) => done(true, &name),
@@ -572,7 +677,12 @@ async fn send_file(m: &MediaRow, headers: &HeaderMap) -> Option<Response> {
 // ---------- posts ----------
 
 async fn posts_create(State(app): S, body: Bytes) -> Response {
-	let b = parse(&body);
+	create_post(&app, &parse(&body)).await
+}
+
+/** Checks and saves a new post. Also used by the inbox folder, so a drop gets every normal check. */
+pub(crate) async fn create_post(app: &Arc<App>, b: &Value) -> Response {
+	let app = app.clone();
 	let mut shape: Vec<Issue> = Vec::new();
 	let key = b["idempotencyKey"].as_str().unwrap_or("");
 	if !(8..=100).contains(&key.encode_utf16().count()) {
@@ -632,11 +742,20 @@ async fn posts_create(State(app): S, body: Bytes) -> Response {
 	let mut demo: Option<bool> = None;
 	for t in wanted {
 		let account_id = t["accountId"].as_str().unwrap_or("");
-		let settings = if t["settings"].is_object() { t["settings"].clone() } else { json!({}) };
+		let mut settings = if t["settings"].is_object() { t["settings"].clone() } else { json!({}) };
 		let Some(a) = get_account(&app, account_id).filter(|a| a.status != "disconnected") else {
 			issues.push(Issue::new(format!("target.{account_id}"), "This account is not connected."));
 			continue;
 		};
+		if settings::drafts_only(&app) {
+			match as_draft(a.platform, &settings) {
+				Some(d) => settings = d,
+				None => {
+					issues.push(Issue::new(format!("target.{}", a.id), DRAFTS_INSTAGRAM));
+					continue;
+				}
+			}
+		}
 		if seen.contains(&a.id) {
 			continue;
 		}
@@ -787,7 +906,7 @@ async fn desktop_pick_video(State(app): S) -> Response {
 	result
 }
 
-async fn import_picked(app: &Arc<App>, source: PathBuf) -> Response {
+pub(crate) async fn import_picked(app: &Arc<App>, source: PathBuf) -> Response {
 	let problem = |m: &str| ok(json!({ "canceled": false, "error": m }));
 	let name = source.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "video.mp4".into());
 	let ext = name.rsplit('.').next().unwrap_or("").to_lowercase();
@@ -932,6 +1051,7 @@ pub fn bridge_script(origin: &str) -> String {
 		}},
 		openExternal: (url) => call('POST', '/api/desktop/open-external', {{ url: String(url) }}).then((j) => Boolean(j.ok)).catch(() => false),
 		revealLogs: () => call('POST', '/api/desktop/reveal-logs').then(() => undefined).catch(() => undefined),
+		revealInbox: () => call('POST', '/api/desktop/reveal-inbox').then(() => undefined).catch(() => undefined),
 		services: () => call('GET', '/api/desktop/services'),
 	}});
 	document.addEventListener('click', (e) => {{
@@ -949,22 +1069,148 @@ pub fn bridge_script(origin: &str) -> String {
 }
 
 pub async fn serve(listener: tokio::net::TcpListener, app: Arc<App>) -> std::io::Result<()> {
-	axum::serve(listener, router(app)).await
+	axum::serve(listener, router(app).into_make_service_with_connect_info::<std::net::SocketAddr>()).await
+}
+
+// ---------- phone access (see phone.rs) ----------
+
+async fn phone_get(State(app): S) -> Response {
+	ok(crate::phone::view(&app, None))
+}
+
+async fn phone_put(State(app): S, body: Bytes) -> Response {
+	match parse(&body)["enabled"].as_bool() {
+		Some(on) => match crate::phone::set_enabled(&app, on) {
+			Ok(v) => ok(v),
+			Err(e) => fail(500, &format!("Could not save phone access: {e}")),
+		},
+		None => fail(400, "Check the fields."),
+	}
+}
+
+async fn phone_pair(State(app): S) -> Response {
+	match crate::phone::pair(&app) {
+		Ok(v) => ok(v),
+		Err(m) => fail(409, m),
+	}
+}
+
+async fn phone_remove(State(app): S, Path(id): Path<String>) -> Response {
+	if crate::phone::remove(&app, &id) {
+		ok(crate::phone::view(&app, None))
+	} else {
+		fail(404, "Not found")
+	}
+}
+
+/** The phone opens the QR code's link: it is paired and lands in the app. */
+async fn phone_redeem(State(app): S, Path(secret): Path<String>, headers: HeaderMap) -> Response {
+	let ua = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or("");
+	match crate::phone::redeem(&app, &secret, ua) {
+		Some(value) => {
+			let mut res = html("<!doctype html><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Publisher</title><body style=\"background:#0c0c0d\"><script>location.replace('/')</script>".to_string());
+			if let Ok(v) = HeaderValue::from_str(&crate::phone::set_cookie(&value, &headers)) {
+				res.headers_mut().insert(header::SET_COOKIE, v);
+			}
+			res
+		}
+		None => {
+			let mut res = html(callback_page(false, "This pairing link has expired or was already used. In Publisher on the computer, open Connected accounts → Phone access and scan a new code."));
+			*res.status_mut() = StatusCode::GONE;
+			res
+		}
+	}
 }
 
 /** Windows app preferences kept in the database: whether finished posts are announced. */
+fn prefs(app: &App) -> Value {
+	json!({ "notifications": crate::notify::enabled(app), "draftsOnly": settings::drafts_only(app) })
+}
+
 async fn desktop_prefs(State(app): S) -> Response {
-	ok(json!({ "notifications": crate::notify::enabled(&app) }))
+	ok(prefs(&app))
 }
 
 async fn desktop_prefs_put(State(app): S, body: Bytes) -> Response {
 	let b = parse(&body);
-	if let Some(on) = b["notifications"].as_bool() {
-		if let Err(e) = settings::save(&app, &[("NOTIFY", if on { None } else { Some("off") })]) {
-			return fail(500, &e);
+	for (field, key) in [("notifications", "NOTIFY"), ("draftsOnly", "DRAFTS_ONLY")] {
+		if let Some(on) = b[field].as_bool() {
+			if let Err(e) = settings::save(&app, &[(key, if on { None } else { Some("off") })]) {
+				return fail(500, &e);
+			}
 		}
 	}
-	ok(json!({ "notifications": crate::notify::enabled(&app) }))
+	ok(prefs(&app))
+}
+
+async fn desktop_reveal_inbox(State(app): S) -> Response {
+	let dir = crate::inbox::dir(&app);
+	let _ = std::fs::create_dir_all(&dir);
+	if let Some(shell) = app.shell.get() {
+		shell.reveal(&dir);
+	}
+	ok(json!({ "ok": true }))
+}
+
+async fn inbox_get(State(app): S) -> Response {
+	ok(crate::inbox::status(&app))
+}
+
+// ---------- saved account groups ----------
+
+async fn groups_list(State(app): S) -> Response {
+	ok(crate::groups::list(&app))
+}
+
+async fn groups_create(State(app): S, body: Bytes) -> Response {
+	let b = parse(&body);
+	match crate::groups::clean(&app, &b["name"], &b["accountIds"]) {
+		Ok((name, ids)) => ok(crate::groups::create(&app, &name, &ids)),
+		Err(m) => fail(422, m),
+	}
+}
+
+async fn groups_update(State(app): S, Path(id): Path<String>, body: Bytes) -> Response {
+	let b = parse(&body);
+	match crate::groups::clean(&app, &b["name"], &b["accountIds"]) {
+		Ok((name, ids)) if crate::groups::update(&app, &id, &name, &ids) => ok(crate::groups::list(&app)),
+		Ok(_) => fail(404, "Not found"),
+		Err(m) => fail(422, m),
+	}
+}
+
+async fn groups_delete(State(app): S, Path(id): Path<String>) -> Response {
+	if crate::groups::delete(&app, &id) {
+		ok(crate::groups::list(&app))
+	} else {
+		fail(404, "Not found")
+	}
+}
+
+// ---------- Terms and Privacy pages (public; platform developer consoles ask for these links) ----------
+
+fn legal_page(title: &str, body: &str) -> Response {
+	let mut res = html(format!(
+		r#"<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Publisher · {title}</title><style>body{{font:16px/1.6 "Segoe UI",system-ui,sans-serif;max-width:680px;margin:40px auto;padding:0 20px;color:#ddd;background:#16161a}}h1{{font-size:24px}}h2{{font-size:17px;margin-top:28px}}</style><h1>{title}</h1>{body}<p style="color:#888;margin-top:32px">Last updated 16 November 2026</p></html>"#
+	));
+	res.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+	res
+}
+
+async fn terms_page() -> Response {
+	legal_page("Terms of Service", "
+<p>Publisher is a private, single-user tool. Its owner uses it to upload their own videos to their own YouTube, Instagram and TikTok accounts. It is not offered to the public.</p>
+<h2>Use</h2><p>Only the owner may use Publisher, and only with accounts they own or are allowed to manage. Each post is started by the owner. Publisher never posts on its own.</p>
+<h2>Platforms</h2><p>Using Publisher with YouTube, Instagram or TikTok is also subject to those platforms' own terms and community guidelines. The owner is responsible for the content they post, including having the rights to any music.</p>
+<h2>No warranty</h2><p>Publisher is provided as is, without any warranty.</p>")
+}
+
+async fn privacy_page() -> Response {
+	legal_page("Privacy Policy", "
+<p>Publisher is a private tool that runs on its owner's own computer. It has no other users and no servers of its own.</p>
+<h2>What it stores</h2><p>When the owner connects an account, Publisher stores the sign-in token and basic profile details (name, handle, avatar) on the owner's computer, encrypted with a key protected by Windows for the signed-in user. It also keeps the owner's videos, captions and post history there.</p>
+<h2>How it is used</h2><p>This data is used only to upload the owner's videos and to show their own post statistics. Publisher has no ads or analytics trackers, and it does not sell or share data with anyone except the platform a video is being posted to.</p>
+<h2>Deleting data</h2><p>Disconnecting an account in Publisher deletes its token. Access can also be removed at any time in the platform's own app settings. Uploaded video copies are deleted automatically after a few days.</p>")
 }
 
 /** The owner finished a TikTok inbox draft in the TikTok app. `permalink` is optional. */

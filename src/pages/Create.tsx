@@ -26,6 +26,9 @@ const nextHalfHour = () => Math.ceil((Date.now() + 15 * 60_000) / 1_800_000) * 1
 
 const PREVIEW_LABEL: Record<Platform, string> = { tiktok: 'TikTok', instagram: 'Reels', youtube: 'Shorts' };
 
+/** Phones and tablets: tap to pick from the camera roll instead of dragging a file. */
+const touch = typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches;
+
 export function CreatePage({ accounts, config, go, onPublished }: { accounts: Account[]; config: Config; go: (p: string) => void; onPublished: () => void }) {
 	const usable = accounts.filter((a) => a.status !== 'disconnected');
 	const [file, setFile] = useState<File | null>(null);
@@ -377,15 +380,15 @@ export function CreatePage({ accounts, config, go, onPublished }: { accounts: Ac
 							<div className="drop" role="button" tabIndex={0} onClick={() => chooseFile()} onKeyDown={(e) => (e.key === 'Enter' || e.key === ' ') && chooseFile()}>
 								<div>
 									<div className="ico"><Icon.upload /></div>
-									<h2>Drop your video</h2>
+									<h2>{touch ? 'Choose a video' : 'Drop your video'}</h2>
 									<p>MP4, MOV or WebM.<br />Vertical 9:16 fits everywhere.</p>
-									<span className="btn sm">Choose file</span>
+									<span className="btn sm">{touch ? 'From your videos' : 'Choose file'}</span>
 								</div>
 							</div>
 						)}
 					</div>
 				</div>
-				<input ref={inputRef} type="file" accept="video/mp4,video/quicktime,video/webm,.mp4,.mov,.webm,.m4v" hidden onChange={(e) => (pick(e.target.files?.[0]), (e.target.value = ''))} />
+				<input ref={inputRef} type="file" accept="video/*,.mp4,.mov,.webm,.m4v" hidden onChange={(e) => (pick(e.target.files?.[0]), (e.target.value = ''))} />
 				{(file || media) && (
 					<div className="stage-meta">
 						<span className="chip ellipsis" style={{ maxWidth: 200 }} title={filename}>{filename}</span>

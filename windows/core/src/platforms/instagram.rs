@@ -19,6 +19,36 @@ use std::sync::LazyLock;
 
 const DAY: i64 = 86_400_000;
 
+/// Unified login and Facebook Login sign in through Facebook and call graph.facebook.com.
+/// Instagram Login (the default) uses graph.instagram.com. Each account remembers its route in `meta.via`.
+pub const FB_GRAPH: &str = "https://graph.facebook.com/v27.0";
+const FB_DIALOG: &str = "https://www.facebook.com/v27.0/dialog/oauth";
+const FB_SCOPES: &str = "instagram_basic,instagram_content_publish,instagram_manage_insights,pages_show_list,pages_read_engagement,business_management";
+
+/** How Instagram signs in: "unified" (a Meta configuration ID), "facebook" (Facebook Login with Pages) or "instagram". */
+pub fn login_mode(app: &App) -> &'static str {
+	if !get(app, "INSTAGRAM_CONFIG_ID").is_empty() {
+		"unified"
+	} else if get(app, "INSTAGRAM_LOGIN") == "facebook" {
+		"facebook"
+	} else {
+		"instagram"
+	}
+}
+
+/** The account was connected through Unified login or Facebook Login, so it lives on graph.facebook.com. */
+pub fn via_facebook(a: &AccountRow) -> bool {
+	a.meta.as_deref().and_then(|m| serde_json::from_str::<Value>(m).ok()).map(|m| matches!(m["via"].as_str(), Some("unified" | "facebook"))).unwrap_or(false)
+}
+
+fn graph_for(app: &App, a: &AccountRow) -> String {
+	if via_facebook(a) {
+		FB_GRAPH.to_string()
+	} else {
+		graph(app)
+	}
+}
+
 fn graph(app: &App) -> String {
 	format!("{}/{}", app.endpoints.instagram_graph, app.cfg.instagram_api_version)
 }
@@ -75,14 +105,91 @@ pub fn validate_settings(s: &Value, caption: &str) -> Vec<Issue> {
 }
 
 pub fn authorize_url(app: &App, state: &str) -> String {
-	let q = form(&[
-		("client_id", &get(app, "INSTAGRAM_APP_ID")),
-		("redirect_uri", &redirect_uri(app, Platform::Instagram)),
-		("response_type", "code"),
-		("scope", "instagram_business_basic,instagram_business_content_publish,instagram_business_manage_insights"),
-		("state", state),
-	]);
-	format!("https://www.instagram.com/oauth/authorize?{q}")
+	let (id, back) = (get(app, "INSTAGRAM_APP_ID"), redirect_uri(app, Platform::Instagram));
+	match login_mode(app) {
+		// Unified login: the configuration set up in Meta decides the permissions and token lifetime.
+		"unified" => {
+			let cfg = get(app, "INSTAGRAM_CONFIG_ID");
+			let q = form(&[("client_id", &id), ("config_id", &cfg), ("redirect_uri", &back), ("response_type", "code"), ("override_default_response_type", "true"), ("state", state)]);
+			format!("{FB_DIALOG}?{q}")
+		}
+		// Facebook Login: sign in with Facebook, then choose the Pages whose Instagram accounts to share.
+		"facebook" => {
+			let q = form(&[("client_id", &id), ("redirect_uri", &back), ("response_type", "code"), ("scope", FB_SCOPES), ("auth_type", "rerequest"), ("state", state)]);
+			format!("{FB_DIALOG}?{q}")
+		}
+		_ => {
+			let q = form(&[
+				("client_id", &id),
+				("redirect_uri", &back),
+				("response_type", "code"),
+				("scope", "instagram_business_basic,instagram_business_content_publish,instagram_business_manage_insights"),
+				// Ask for the account's credentials even when Instagram is already signed in, so a second account can be added.
+				("force_reauth", "true"),
+				("state", state),
+			]);
+			format!("https://www.instagram.com/oauth/authorize?{q}")
+		}
+	}
+}
+
+fn expires(t: &Value) -> Option<i64> {
+	t["expires_in"].as_f64().filter(|s| *s > 0.0).map(|s| now_ms() + s as i64 * 1000)
+}
+
+/** Unified login and Facebook Login: swap the code on graph.facebook.com. */
+async fn exchange_facebook(app: &App, code: &str, facebook: bool) -> Result<TokenSet, PubError> {
+	let (id, secret, back) = (get(app, "INSTAGRAM_APP_ID"), get(app, "INSTAGRAM_APP_SECRET"), redirect_uri(app, Platform::Instagram));
+	let q = form(&[("client_id", &id), ("client_secret", &secret), ("redirect_uri", &back), ("code", code)]);
+	let t = json(app, Req::get(&format!("{FB_GRAPH}/oauth/access_token?{q}"))).await?;
+	if !facebook {
+		// Portfolio-owned token. Its lifetime comes from the configuration ("Never" is recommended).
+		return Ok(TokenSet { access_token: js_str(&t["access_token"]), access_expires_at: expires(&t), ..Default::default() });
+	}
+	// Long-lived user token; each Page's token taken from it does not expire.
+	let l = form(&[("grant_type", "fb_exchange_token"), ("client_id", &id), ("client_secret", &secret), ("fb_exchange_token", &js_str(&t["access_token"]))]);
+	let long = json(app, Req::get(&format!("{FB_GRAPH}/oauth/access_token?{l}"))).await?;
+	Ok(TokenSet { access_token: js_str(&long["access_token"]), access_expires_at: expires(&long), ..Default::default() })
+}
+
+/// Every Instagram account a sign-in shares. Unified login and Facebook Login can share several.
+pub async fn identities(app: &App, access_token: &str) -> Result<Vec<Identity>, PubError> {
+	let who = |a: &Value, fallback: &str, meta: Value, tokens: Option<TokenSet>| {
+		let (name, user) = (js_str(&a["name"]), js_str(&a["username"]));
+		Identity {
+			external_id: js_str(&a["id"]),
+			display_name: [name, user.clone(), fallback.to_string()].into_iter().find(|s| !s.is_empty()).unwrap_or_default(),
+			handle: (!user.is_empty()).then(|| format!("@{user}")),
+			avatar_url: a["profile_picture_url"].as_str().map(String::from),
+			meta: Some(meta),
+			tokens,
+		}
+	};
+	match login_mode(app) {
+		"facebook" => {
+			let r = json(app, Req::get(&format!("{FB_GRAPH}/me/accounts?fields=name,access_token,instagram_business_account{{id,username,name,profile_picture_url}}&limit=100")).bearer(access_token)).await?;
+			let list: Vec<Identity> = r["data"]
+				.as_array()
+				.into_iter()
+				.flatten()
+				.filter(|p| js_truthy(&p["instagram_business_account"]["id"]))
+				.map(|p| who(&p["instagram_business_account"], &js_str(&p["name"]), j!({ "via": "facebook", "pageId": p["id"] }), Some(TokenSet { access_token: js_str(&p["access_token"]), ..Default::default() })))
+				.collect();
+			if list.is_empty() {
+				return Err(PubError::attention("No Instagram account came through. Link each Instagram account to a Facebook Page you manage, then connect again and tick those Pages when Facebook asks."));
+			}
+			Ok(list)
+		}
+		"unified" => {
+			let r = json(app, Req::get(&format!("{FB_GRAPH}/me/assigned_instagram_accounts?fields=id,username,name,profile_picture_url")).bearer(access_token)).await?;
+			let list: Vec<Identity> = r["data"].as_array().into_iter().flatten().map(|a| who(a, "Instagram account", j!({ "via": "unified" }), None)).collect();
+			if list.is_empty() {
+				return Err(PubError::attention("Meta did not share any Instagram account. Sign in again and tick your Instagram account(s) when asked, and make sure your Meta configuration includes the business_management permission."));
+			}
+			Ok(list)
+		}
+		_ => Ok(vec![identity(app, access_token).await?]),
+	}
 }
 
 fn long_expiry(t: &Value) -> i64 {
@@ -90,6 +197,11 @@ fn long_expiry(t: &Value) -> i64 {
 }
 
 pub async fn exchange_code(app: &App, code: &str) -> Result<TokenSet, PubError> {
+	match login_mode(app) {
+		"unified" => return exchange_facebook(app, code, false).await,
+		"facebook" => return exchange_facebook(app, code, true).await,
+		_ => {}
+	}
 	let secret = get(app, "INSTAGRAM_APP_SECRET");
 	let url = format!("{}/oauth/access_token", app.endpoints.instagram_api);
 	let short = json(
@@ -110,6 +222,13 @@ pub async fn exchange_code(app: &App, code: &str) -> Result<TokenSet, PubError> 
 
 pub async fn refresh(app: &App, account: &AccountRow, access_token: Option<&str>) -> Result<TokenSet, PubError> {
 	let Some(token) = access_token.filter(|s| !s.is_empty()) else { return Err(PubError::permanent("No token stored")) };
+	if via_facebook(account) {
+		// Facebook-route tokens are not refreshed by the app; an expired one means signing in again.
+		if account.access_expires_at.map(|t| t > now_ms()).unwrap_or(true) {
+			return Ok(TokenSet { access_token: token.to_string(), access_expires_at: account.access_expires_at, ..Default::default() });
+		}
+		return Err(PubError::auth("This Instagram sign-in has expired. Reconnect it in Connected accounts."));
+	}
 	// Long-lived tokens can be refreshed once they are at least 24 hours old and not yet expired.
 	if now_ms() - account.updated_at < DAY && account.access_expires_at.unwrap_or(0) > now_ms() {
 		return Ok(TokenSet { access_token: token.to_string(), access_expires_at: account.access_expires_at, ..Default::default() });
@@ -134,6 +253,7 @@ pub async fn identity(app: &App, access_token: &str) -> Result<Identity, PubErro
 		handle: (!username.is_empty()).then(|| format!("@{username}")),
 		avatar_url: me["profile_picture_url"].as_str().map(String::from),
 		meta: Some(j!({ "accountType": kind })),
+		tokens: None,
 	})
 }
 
@@ -170,7 +290,7 @@ pub async fn run(ctx: &mut Ctx) -> Result<Outcome, PubError> {
 	}
 	let token = ctx.token().await?;
 	let ig_id = ctx.account.external_id.clone();
-	let g = graph(&app);
+	let g = graph_for(&app, &ctx.account);
 
 	if !js_truthy(&ctx.rf()["containerId"]) {
 		ctx.need_file()?;
@@ -266,12 +386,12 @@ pub async fn run(ctx: &mut Ctx) -> Result<Outcome, PubError> {
 
 async fn container(ctx: &Ctx, id: &str) -> Result<Value, PubError> {
 	let token = ctx.token().await?;
-	json(&ctx.app, Req::get(&format!("{}/{id}?fields=status_code,status", graph(&ctx.app))).bearer(&token)).await
+	json(&ctx.app, Req::get(&format!("{}/{id}?fields=status_code,status", graph_for(&ctx.app, &ctx.account))).bearer(&token)).await
 }
 
 async fn recent_media(ctx: &Ctx) -> Result<Vec<Value>, PubError> {
 	let token = ctx.token().await?;
-	let url = format!("{}/{}/media?fields=id,permalink,timestamp,caption,media_product_type&limit=25", graph(&ctx.app), ctx.account.external_id);
+	let url = format!("{}/{}/media?fields=id,permalink,timestamp,caption,media_product_type&limit=25", graph_for(&ctx.app, &ctx.account), ctx.account.external_id);
 	let r = json(&ctx.app, Req::get(&url).bearer(&token)).await?;
 	Ok(r["data"].as_array().cloned().unwrap_or_default())
 }
@@ -315,7 +435,7 @@ async fn finish_with(ctx: &Ctx, media_id: &str, permalink: Option<String>) -> Re
 	let mut link = permalink.filter(|s| !s.is_empty());
 	if link.is_none() {
 		let token = ctx.token().await?;
-		let m = json(&ctx.app, Req::get(&format!("{}/{media_id}?fields=permalink", graph(&ctx.app))).bearer(&token)).await.unwrap_or(Value::Null);
+		let m = json(&ctx.app, Req::get(&format!("{}/{media_id}?fields=permalink", graph_for(&ctx.app, &ctx.account))).bearer(&token)).await.unwrap_or(Value::Null);
 		link = m["permalink"].as_str().map(String::from);
 	}
 	Ok(Outcome::Published { permalink: link, remote_id: Some(media_id.to_string()), message: None })

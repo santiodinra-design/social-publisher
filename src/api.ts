@@ -9,6 +9,13 @@ export type Config = { demoMode: boolean; publicBaseUrl: boolean; videoHosting?:
 /** The inbox folder that turns dropped videos into drafts (Mac app). */
 export type Inbox = { enabled: boolean; dir: string; recent: { name: string; at: number; status: 'sent' | 'failed' | 'working'; message: string; postId?: string }[] };
 export type Prefs = { notifications: boolean; draftsOnly?: boolean };
+/** `phone`: this page runs on a paired phone. `phonePairing`: phone access is on, so an unpaired phone is told how to pair. */
+export type Session = { signedIn: boolean; demoMode: boolean; noSignIn?: boolean; desktop?: boolean; phone?: boolean; phonePairing?: boolean };
+/** Phone access (feature `phone`): paired phones, and where they reach this computer. */
+export type PhoneAccess = { enabled: boolean; wifiUrl: string | null; httpsUrl: string | null; problem: string | null; devices: { id: string; name: string; createdAt: number; lastSeenAt: number | null }[] };
+export type Pairing = { url: string; awayUrl: string | null; qr: string; expiresAt: number };
+/** Set once the session is known: true when this page runs on a paired phone. */
+export const where = { phone: false };
 /** Whether the backend offers a feature beyond the original contract (the Windows build lists them; the Mac server lists none). */
 export const has = (c: Config | null | undefined, feature: string) => Boolean(c?.features?.includes(feature));
 export type Media = { id: string; filename: string; size: number; duration: number | null; width: number | null; height: number | null; videoCodec: string | null; audioCodec: string | null; fps?: number | null; shortsShape: boolean; issues: Record<Platform, string[]>; previewUrl?: string };
@@ -69,7 +76,7 @@ async function call<T>(method: string, url: string, body?: unknown): Promise<T> 
 }
 
 export const api = {
-	session: () => call<{ signedIn: boolean; demoMode: boolean; noSignIn?: boolean }>('GET', '/api/session'),
+	session: () => call<Session>('GET', '/api/session'),
 	signIn: (password: string) => call('POST', '/api/session', { password }),
 	signOut: () => call('DELETE', '/api/session'),
 	config: () => call<Config>('GET', '/api/config'),
@@ -106,6 +113,10 @@ export const api = {
 	prefs: () => call<Prefs>('GET', '/api/desktop/prefs'),
 	setPrefs: (p: Partial<Prefs>) => call<Prefs>('PUT', '/api/desktop/prefs', p),
 	inbox: () => call<Inbox>('GET', '/api/inbox'),
+	phone: () => call<PhoneAccess>('GET', '/api/phone'),
+	setPhone: (enabled: boolean) => call<PhoneAccess>('PUT', '/api/phone', { enabled }),
+	pairPhone: () => call<Pairing>('POST', '/api/phone/pair', {}),
+	removePhone: (id: string) => call<PhoneAccess>('DELETE', `/api/phone/devices/${id}`),
 	cancelSchedule: (id: string) => call<{ post: Post }>('POST', `/api/posts/${id}/cancel`, {}),
 };
 

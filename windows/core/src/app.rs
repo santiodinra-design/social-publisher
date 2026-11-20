@@ -95,6 +95,8 @@ pub struct Notice {
 	pub title: String,
 	pub body: String,
 	pub ok: bool,
+	/// Text the desktop app puts on the clipboard: the TikTok caption, which TikTok drafts cannot carry.
+	pub copy: Option<String>,
 }
 
 pub struct PendingOAuth {
@@ -126,6 +128,10 @@ pub struct App {
 	pub(crate) picking: AtomicBool,
 	/// Tests skip the adapters' waits.
 	pub fast_sleep: AtomicBool,
+	/// One-use phone pairing links: secret -> expiry (see `phone.rs`).
+	pub(crate) pairing: Mutex<HashMap<String, i64>>,
+	/// The Wi-Fi listener for paired phones, while phone access is on: its address and task.
+	pub(crate) phone_listener: Mutex<Option<(std::net::SocketAddr, tokio::task::AbortHandle)>>,
 }
 
 impl App {
@@ -147,6 +153,8 @@ impl App {
 			upload_progress: AtomicU32::new(0),
 			picking: AtomicBool::new(false),
 			fast_sleep: AtomicBool::new(false),
+			pairing: Mutex::new(HashMap::new()),
+			phone_listener: Mutex::new(None),
 		})
 	}
 

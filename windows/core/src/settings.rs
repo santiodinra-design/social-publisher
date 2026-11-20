@@ -22,13 +22,33 @@ pub struct Fields {
 pub fn fields(p: Platform) -> Fields {
 	match p {
 		Platform::Youtube => Fields { id: "GOOGLE_CLIENT_ID", secret: "GOOGLE_CLIENT_SECRET", id_label: "Client ID", secret_label: "Client secret" },
-		Platform::Instagram => Fields { id: "INSTAGRAM_APP_ID", secret: "INSTAGRAM_APP_SECRET", id_label: "Instagram app ID", secret_label: "Instagram app secret" },
+		Platform::Instagram => Fields { id: "INSTAGRAM_APP_ID", secret: "INSTAGRAM_APP_SECRET", id_label: "App ID", secret_label: "App secret" },
 		Platform::Tiktok => Fields { id: "TIKTOK_CLIENT_KEY", secret: "TIKTOK_CLIENT_SECRET", id_label: "Client key", secret_label: "Client secret" },
 	}
 }
 
-/// `NOTIFY` ("off" or unset) is the Windows app's notification choice.
-const ALLOWED: [&str; 8] = ["GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "INSTAGRAM_APP_ID", "INSTAGRAM_APP_SECRET", "TIKTOK_CLIENT_KEY", "TIKTOK_CLIENT_SECRET", "PUBLIC_BASE_URL", "NOTIFY"];
+/// `NOTIFY` and `DRAFTS_ONLY` ("off" or unset) are on/off choices. `INSTAGRAM_CONFIG_ID` and
+/// `INSTAGRAM_LOGIN` pick how Instagram signs in (see `instagram::login_mode`).
+/// `PHONE_ACCESS` ("on" or unset) lets paired phones use the app over Wi-Fi (see `phone.rs`).
+const ALLOWED: [&str; 12] = [
+	"GOOGLE_CLIENT_ID",
+	"GOOGLE_CLIENT_SECRET",
+	"INSTAGRAM_APP_ID",
+	"INSTAGRAM_APP_SECRET",
+	"TIKTOK_CLIENT_KEY",
+	"TIKTOK_CLIENT_SECRET",
+	"PUBLIC_BASE_URL",
+	"NOTIFY",
+	"DRAFTS_ONLY",
+	"INSTAGRAM_CONFIG_ID",
+	"INSTAGRAM_LOGIN",
+	"PHONE_ACCESS",
+];
+
+/** Drafts only (on unless the owner turned it off): nothing Publisher sends can go public by itself. */
+pub fn drafts_only(app: &App) -> bool {
+	get(app, "DRAFTS_ONLY") != "off"
+}
 
 fn load(app: &App) -> Arc<HashMap<String, String>> {
 	if let Some((at, values)) = app.settings_cache.lock().as_ref() {
@@ -123,9 +143,7 @@ pub fn setup_view(app: &App) -> Value {
 			let id = saved.get(f.id).cloned().unwrap_or_default();
 			let secret = saved.get(f.secret).cloned().unwrap_or_default();
 			let from_app = saved.contains_key(f.id) || saved.contains_key(f.secret);
-			(
-				p.as_str().to_string(),
-				json!({
+			let mut view = json!({
 					"configured": !id.is_empty() && !secret.is_empty(),
 					"hosted": crate::relay::hosted(app, *p),
 					"source": if from_app { Value::from("app") } else { Value::Null },
@@ -134,8 +152,13 @@ pub fn setup_view(app: &App) -> Value {
 					"redirectUri": redirect_uri(app, *p),
 					"idLabel": f.id_label,
 					"secretLabel": f.secret_label,
-				}),
-			)
+			});
+			if *p == Platform::Instagram {
+				let cfg = saved.get("INSTAGRAM_CONFIG_ID").cloned().unwrap_or_default();
+				view["loginMode"] = Value::from(crate::platforms::instagram::login_mode(app));
+				view["configPreview"] = if cfg.is_empty() { Value::Null } else { Value::from(mask(&cfg)) };
+			}
+			(p.as_str().to_string(), view)
 		})
 		.collect();
 	json!({
@@ -170,7 +193,7 @@ pub fn check_keys(p: Platform, id: &str, secret: &str) -> Vec<Issue> {
 		out.push(Issue::new("secret", "This is the client ID again. Paste the client secret."));
 	}
 	if p == Platform::Instagram && !i.is_empty() && !(i.len() >= 6 && i.bytes().all(|b| b.is_ascii_digit())) {
-		out.push(Issue::new("id", "The Instagram app ID is a number."));
+		out.push(Issue::new("id", "The app ID is a number."));
 	}
 	out
 }

@@ -44,7 +44,17 @@ pub fn after_target(app: &App, post_id: &str) {
 	if !enabled(app) {
 		return;
 	}
-	let notice = summarize(post_id, &rows, &caption, &filename, is_demo);
+	// TikTok drafts cannot carry a caption, so the finish notice hands it over for the clipboard.
+	let own: String = app
+		.db()
+		.query_row("SELECT settings FROM targets WHERE post_id = ? AND platform = 'tiktok' LIMIT 1", [post_id], |r| r.get::<_, Option<String>>(0))
+		.ok()
+		.flatten()
+		.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+		.map(|v| crate::util::js_str(&v["captionOverride"]).trim().to_string())
+		.unwrap_or_default();
+	let tiktok_caption = if own.is_empty() { caption.trim().to_string() } else { own };
+	let notice = summarize(post_id, &rows, &caption, &filename, is_demo, &tiktok_caption);
 	app.log.line(&format!("[notify] {} ({})", notice.title, if notice.ok { "ok" } else { "problem" }));
 	if let Some(shell) = app.shell.get() {
 		shell.notify(&notice);
@@ -75,13 +85,13 @@ fn short(text: &str, max: usize) -> String {
 	}
 }
 
-fn summarize(post_id: &str, rows: &[Row], caption: &str, filename: &str, is_demo: bool) -> Notice {
+fn summarize(post_id: &str, rows: &[Row], caption: &str, filename: &str, is_demo: bool, tiktok_caption: &str) -> Notice {
 	let what = if caption.trim().is_empty() { filename.to_string() } else { short(caption, 80) };
 	let inbox = |r: &Row| r.platform == Platform::Tiktok && r.state == "needs_attention" && r.error.as_deref().map(|e| e.contains("TikTok inbox")).unwrap_or(false);
 	let published: Vec<&Row> = rows.iter().filter(|r| r.state == "published").collect();
 	let drafts: Vec<&Row> = rows.iter().filter(|r| inbox(r)).collect();
 	let problems: Vec<&Row> = rows.iter().filter(|r| r.state == "failed" || (r.state == "needs_attention" && !inbox(r))).collect();
-	let notice = |title: String, body: String, ok: bool| Notice { post_id: post_id.to_string(), title, body, ok };
+	let notice = |title: String, body: String, ok: bool| Notice { post_id: post_id.to_string(), title, body, ok, copy: None };
 
 	if is_demo {
 		return notice("Simulation finished".into(), format!("Nothing was posted. {what}"), problems.is_empty());
@@ -93,7 +103,12 @@ fn summarize(post_id: &str, rows: &[Row], caption: &str, filename: &str, is_demo
 	}
 	if !drafts.is_empty() {
 		let done = if published.is_empty() { String::new() } else { format!("Published to {}. ", names(&published)) };
-		return notice("Sent to your TikTok inbox".into(), format!("{done}Open TikTok to finish posting: {what}"), true);
+		if tiktok_caption.is_empty() {
+			return notice("Sent to your TikTok inbox".into(), format!("{done}Open TikTok to finish posting: {what}"), true);
+		}
+		let mut n = notice("Sent to your TikTok inbox".into(), format!("{done}Caption copied. Open the TikTok draft and paste it."), true);
+		n.copy = Some(tiktok_caption.chars().take(5000).collect());
+		return n;
 	}
 	notice(format!("Published to {}", names(&published)), what, true)
 }
@@ -109,19 +124,22 @@ mod tests {
 	#[test]
 	fn says_what_happened_in_one_line() {
 		let all = [row(Platform::Instagram, "published", None), row(Platform::Youtube, "published", None)];
-		assert_eq!(summarize("p", &all, "Summer trip\nmore", "a.mp4", false), Notice { post_id: "p".into(), title: "Published to Instagram and YouTube".into(), body: "Summer trip".into(), ok: true });
+		assert_eq!(summarize("p", &all, "Summer trip\nmore", "a.mp4", false, ""), Notice { post_id: "p".into(), title: "Published to Instagram and YouTube".into(), body: "Summer trip".into(), ok: true, copy: None });
 
 		let inbox = [row(Platform::Tiktok, "needs_attention", Some("Sent to your TikTok inbox. Open TikTok…")), row(Platform::Youtube, "published", None)];
-		let n = summarize("p", &inbox, "", "clip.mp4", false);
+		let n = summarize("p", &inbox, "", "clip.mp4", false, "");
 		assert_eq!((n.title.as_str(), n.ok), ("Sent to your TikTok inbox", true));
 		assert_eq!(n.body, "Published to YouTube. Open TikTok to finish posting: clip.mp4");
+		// With a caption, the draft notice hands it over for the clipboard.
+		let n = summarize("p", &inbox, "Hi #tag", "clip.mp4", false, "Hi #tag");
+		assert_eq!((n.body.as_str(), n.copy.as_deref()), ("Published to YouTube. Caption copied. Open the TikTok draft and paste it.", Some("Hi #tag")));
 
 		let bad = [row(Platform::Instagram, "failed", Some("Instagram could not process the video: bad codec")), row(Platform::Youtube, "published", None)];
-		let n = summarize("p", &bad, "x", "a.mp4", false);
+		let n = summarize("p", &bad, "x", "a.mp4", false, "x");
 		assert_eq!((n.title.as_str(), n.ok), ("Couldn't finish Instagram", false));
 		assert!(n.body.starts_with("Published to YouTube. Instagram could not process"));
 
-		let demo = summarize("p", &all, "hi", "a.mp4", true);
+		let demo = summarize("p", &all, "hi", "a.mp4", true, "hi");
 		assert_eq!((demo.title.as_str(), demo.body.as_str()), ("Simulation finished", "Nothing was posted. hi"));
 		assert_eq!(short(&"word ".repeat(40), 20).chars().count(), 20);
 	}

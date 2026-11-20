@@ -1,9 +1,10 @@
 import React, { useEffect, useState } from 'react';
 import { computer, desktop, openSignIn } from '../desktop';
-import { has, api, ApiError, fmtTime, PLATFORM_NAME, type Account, type IgLogin, type Config, type Issue, type Platform, type Setup } from '../api';
+import { has, api, where, ApiError, fmtTime, PLATFORM_NAME, type Account, type IgLogin, type Config, type Issue, type Platform, type Setup } from '../api';
 import { Avatar, FieldError, Icon, PlatformMark, Seg } from '../ui';
 import { GroupsManager } from './GroupsManager';
 import { InboxPanel } from './InboxPanel';
+import { PhonePanel } from './PhonePanel';
 
 type Step = { text: React.ReactNode; link?: [string, string] };
 
@@ -288,6 +289,12 @@ export function AccountsPage({ accounts, config, refresh, refreshConfig }: { acc
 					{!accounts.some((x) => x.isDemo) && <button className="btn sm" onClick={async () => (await api.addDemoAccounts(), refresh())}>Add demo accounts</button>}
 				</div>
 			)}
+			{where.phone && (
+				<div className="notice" style={{ marginBottom: 14 }}>
+					<Icon.info />
+					<span className="grow">Connecting accounts and app keys happen in Publisher on the computer. Accounts connected there can be used from this phone.</span>
+				</div>
+			)}
 			{(['youtube', 'instagram', 'tiktok'] as Platform[]).map((p, _i, all) => {
 				const firstUnset = all.find((x) => !config.platforms[x].configured);
 				const info = config.platforms[p];
@@ -305,8 +312,8 @@ export function AccountsPage({ accounts, config, refresh, refreshConfig }: { acc
 								<b>{PLATFORM_NAME[p]}</b>
 								<small>{info.configured ? short : (p === 'instagram' ? 'Not set up yet · about 10–15 minutes' : p === 'tiktok' ? 'Not set up yet · about 10 minutes' : 'Not set up yet · about 5 minutes')}</small>
 							</div>
-							{hosted && devKeys && !open && <button className="btn sm quiet" onClick={() => setEditing(p)}>Own keys</button>}
-							{info.configured ? (
+							{!where.phone && hosted && devKeys && !open && <button className="btn sm quiet" onClick={() => setEditing(p)}>Own keys</button>}
+							{where.phone ? null : info.configured ? (
 								!open && <button className={`btn sm ${real.length ? '' : 'primary'}`} onClick={() => connectPlatform(p)}>{real.length ? 'Add another' : 'Connect'}</button>
 							) : (
 								<button className={`btn sm ${open || p !== firstUnset ? '' : 'primary'}`} onClick={() => setEditing(open ? null : p)}>{open ? 'Close' : 'Set up'}</button>
@@ -314,7 +321,7 @@ export function AccountsPage({ accounts, config, refresh, refreshConfig }: { acc
 						</div>
 						{info.configured && !hosted && real.length > 0 && !open && <div className="hint pad add-hint">{ADD_ANOTHER[p]}</div>}
 						{p === 'instagram' && hosted && !real.length && !open && <div className="hint pad" style={{ paddingTop: 0 }}>Needs an Instagram Professional account (Business or Creator). You can switch for free in the Instagram app’s settings.</div>}
-						{info.configured && !hosted && !open && s && (
+						{!where.phone && info.configured && !hosted && !open && s && (
 							<div className="keyline">
 								<span className="dot" style={{ background: 'var(--ok)' }} />
 								<span className="grow ellipsis">App keys {s.source === 'env' ? 'from .env' : 'saved'} · <span className="mono">{s.idPreview}</span></span>
@@ -322,7 +329,7 @@ export function AccountsPage({ accounts, config, refresh, refreshConfig }: { acc
 								{s.source === 'app' && <button className="btn sm quiet danger" onClick={() => removeKeys(p)}>Remove</button>}
 							</div>
 						)}
-						{p === 'instagram' && info.configured && !info.available && !open && setup && <PublicUrl setup={setup} onSaved={(x) => (setSetup(x), refreshConfig())} />}
+						{!where.phone && p === 'instagram' && info.configured && !info.available && !open && setup && <PublicUrl setup={setup} onSaved={(x) => (setSetup(x), refreshConfig())} />}
 						{open && setup && <SetupPanel p={p} setup={setup} onSaved={(x, c) => saved(p, x, c)} onClose={() => setEditing(null)} />}
 						{list.map((a) => (
 							<div className="acct" key={a.id}>
@@ -338,7 +345,7 @@ export function AccountsPage({ accounts, config, refresh, refreshConfig }: { acc
 										{a.status === 'connected' ? `Connected ${fmtTime(a.connectedAt)}` : a.statusDetail ?? 'Needs reconnecting'}
 									</div>
 								</div>
-								{!a.isDemo && info.configured && a.status !== 'connected' && <button className="btn sm primary" onClick={() => connectPlatform(p)}><Icon.retry /> Reconnect</button>}
+								{!where.phone && !a.isDemo && info.configured && a.status !== 'connected' && <button className="btn sm primary" onClick={() => connectPlatform(p)}><Icon.retry /> Reconnect</button>}
 								<button className="btn sm quiet danger" disabled={busy === a.id} onClick={() => disconnect(a)}>Disconnect</button>
 							</div>
 						))}
@@ -347,6 +354,7 @@ export function AccountsPage({ accounts, config, refresh, refreshConfig }: { acc
 			})}
 			{has(config, 'groups') && <GroupsManager accounts={accounts} />}
 			{has(config, 'inbox') && <InboxPanel />}
+			{has(config, 'phone') && !where.phone && <PhonePanel />}
 			<p className="faint" style={{ fontSize: 12 }}>
 				{anyHosted
 					? <>Accounts connect through each platform’s official sign-in page. This app never sees your passwords, and sign-in tokens stay encrypted on this {computer}.</>

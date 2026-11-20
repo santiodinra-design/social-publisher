@@ -85,6 +85,8 @@ pub struct Identity {
 	pub handle: Option<String>,
 	pub avatar_url: Option<String>,
 	pub meta: Option<Value>,
+	/// This account's own token, when one sign-in yields a different token per account (Facebook Pages).
+	pub tokens: Option<TokenSet>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -214,8 +216,16 @@ pub async fn refresh(app: &App, a: &AccountRow, refresh_token: Option<&str>, acc
 pub async fn identity(app: &App, p: Platform, access_token: &str, tokens: &TokenSet) -> Result<Identity, PubError> {
 	match p {
 		Platform::Tiktok => tiktok::identity(app, access_token, tokens).await,
-		Platform::Instagram => instagram::identity(app, access_token).await,
+		Platform::Instagram => instagram::identities(app, access_token).await?.into_iter().next().ok_or_else(|| PubError::attention("Instagram did not share an account.")),
 		Platform::Youtube => youtube::identity(app, access_token).await,
+	}
+}
+
+/** Every account one sign-in grants. Only Instagram's Facebook routes can grant several. */
+pub async fn identities(app: &App, p: Platform, access_token: &str, tokens: &TokenSet) -> Result<Vec<Identity>, PubError> {
+	match p {
+		Platform::Instagram => instagram::identities(app, access_token).await,
+		_ => Ok(vec![identity(app, p, access_token, tokens).await?]),
 	}
 }
 

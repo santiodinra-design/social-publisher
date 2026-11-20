@@ -56,7 +56,9 @@ pub fn authorize_url(app: &App, state: &str) -> String {
 	if app.cfg.tiktok_direct_post {
 		scopes.push("video.publish");
 	}
-	let q = form(&[("client_key", &get(app, "TIKTOK_CLIENT_KEY")), ("scope", &scopes.join(",")), ("response_type", "code"), ("redirect_uri", &redirect_uri(app, Platform::Tiktok)), ("state", state)]);
+	let q = form(&[("client_key", &get(app, "TIKTOK_CLIENT_KEY")), ("scope", &scopes.join(",")), ("response_type", "code"), ("redirect_uri", &redirect_uri(app, Platform::Tiktok)), ("state", state),
+		// Ask which TikTok account to use instead of silently reusing the signed-in one.
+		("disable_auto_auth", "1")]);
 	format!("https://www.tiktok.com/v2/auth/authorize/?{q}")
 }
 
@@ -106,6 +108,7 @@ pub async fn identity(app: &App, access_token: &str, tokens: &TokenSet) -> Resul
 		handle: None,
 		avatar_url: u["avatar_url"].as_str().map(String::from),
 		meta: None,
+		tokens: None,
 	})
 }
 

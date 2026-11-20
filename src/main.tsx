@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import './styles.css';
-import { api, has, type Account, type Config, type Post, type Status } from './api';
+import { api, has, where, type Account, type Config, type Post, type Session, type Status } from './api';
 import { computer, desktop, logsHint, onWindows } from './desktop';
 import { Icon } from './ui';
 import { enableSounds, sounds } from './sounds';
@@ -22,7 +22,7 @@ function NotifyToggle() {
 	);
 }
 
-/** Drafts only: YouTube goes up Private and TikTok to the inbox, so nothing goes public by itself. */
+/** Drafts only: TikTok goes to the inbox and Instagram is skipped. YouTube keeps the visibility chosen in the composer. */
 function DraftsToggle({ on, changed }: { on: boolean; changed: () => void }) {
 	return (
 		<button className={`ghost-link ${on ? 'drafts-on' : ''}`} aria-pressed={on} title={on ? 'Drafts only: TikTok goes to your inbox and Instagram is skipped. YouTube uses the visibility you choose (click to allow Instagram)' : 'Instagram allowed (click to switch back to drafts only)'} onClick={async () => (await api.setPrefs({ draftsOnly: !on }), changed())}>
@@ -56,7 +56,7 @@ type Path = keyof typeof PAGES;
 
 function App() {
 	const [path, setPath] = useState<Path>(() => (location.pathname in PAGES ? (location.pathname as Path) : '/'));
-	const [session, setSession] = useState<{ signedIn: boolean; demoMode: boolean; noSignIn?: boolean; desktop?: boolean } | null>(null);
+	const [session, setSession] = useState<Session | null>(null);
 	const [config, setConfig] = useState<Config | null>(null);
 	const [accounts, setAccounts] = useState<Account[]>([]);
 	const [posts, setPosts] = useState<Post[] | null>(null);
@@ -86,6 +86,7 @@ function App() {
 	useEffect(() => {
 		api.session()
 			.then((s) => {
+				where.phone = Boolean(s.phone);
 				setSession(s);
 				if (s.signedIn) load().catch(() => setOffline(true));
 			})
@@ -120,7 +121,8 @@ function App() {
 			</div>
 		);
 	if (!session) return null;
-	if (!session.signedIn) return <Login onDone={() => (setSession({ ...session, signedIn: true }), load())} />;
+	// The desktop apps have no password: a phone that is not paired yet is told how to pair.
+	if (!session.signedIn) return session.desktop ? <PairHint pairing={Boolean(session.phonePairing)} /> : <Login onDone={() => (setSession({ ...session, signedIn: true }), load())} />;
 
 	const page = PAGES[path];
 	const live = accounts.filter((a) => a.status !== 'disconnected');
@@ -155,9 +157,10 @@ function App() {
 					{session.noSignIn && <span className="chip warn signin-off" title="Password protection is off (NO_SIGN_IN=true). Only this computer can open the app. Turn sign-in back on before sharing or tunnelling it.">Sign-in off · local only</span>}
 					<WorkerStatus status={status} inFlight={inFlight} desktop={Boolean(session.desktop)} />
 					<SoundToggle />
-					{has(config, 'draftsOnly') && <DraftsToggle on={config?.draftsOnly !== false} changed={() => api.config().then(setConfig).catch(() => undefined)} />}
-					{has(config, 'notifications') && <NotifyToggle />}
-					{!session.noSignIn && !session.desktop && <button className="ghost-link" aria-label="Sign out" onClick={async () => (await api.signOut(), location.reload())}><Icon.out /> <span>Sign out</span></button>}
+					{has(config, 'draftsOnly') && session.phone && <span className={`ghost-link ${config?.draftsOnly !== false ? 'drafts-on' : ''}`} title={config?.draftsOnly !== false ? 'Drafts only (change it on the computer)' : 'Public allowed (change it on the computer)'}><Icon.check /></span>}
+					{has(config, 'draftsOnly') && !session.phone && <DraftsToggle on={config?.draftsOnly !== false} changed={() => api.config().then(setConfig).catch(() => undefined)} />}
+					{has(config, 'notifications') && !session.phone && <NotifyToggle />}
+					{!session.noSignIn && !session.desktop && <button className="ghost-link" aria-label={session.phone ? 'Unpair this phone' : 'Sign out'} onClick={async () => { if (session.phone && !confirm('Unpair this phone? To use it again, scan a new code in Publisher on the computer.')) return; await api.signOut(); location.reload(); }}><Icon.out /> <span>{session.phone ? 'Unpair' : 'Sign out'}</span></button>}
 				</div>
 			</nav>
 			<main className="main">
@@ -179,6 +182,26 @@ function App() {
 					)}
 				</div>
 			</main>
+		</div>
+	);
+}
+
+/** Shown on a phone that is not paired with the computer yet. */
+function PairHint({ pairing }: { pairing: boolean }) {
+	return (
+		<div className="login">
+			<div className="panel">
+				<div className="brand" style={{ padding: '0 0 14px' }}>
+					<span className="brand-mark"><Icon.play /></span>
+					<div><b>Publisher</b><small>Pair this phone</small></div>
+				</div>
+				<p style={{ margin: '0 0 10px', lineHeight: 1.5 }}>
+					{pairing
+						? 'Open Publisher on your computer, go to Connected accounts → Phone access, tap Pair a phone and scan the code with this phone’s camera.'
+						: 'Phone access is turned off. Turn it on in Publisher on your computer: Connected accounts → Phone access.'}
+				</p>
+				<button className="btn" style={{ width: '100%' }} onClick={() => location.reload()}>I scanned it, try again</button>
+			</div>
 		</div>
 	);
 }

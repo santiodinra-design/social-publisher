@@ -55,8 +55,14 @@ async fn account(app: &Arc<App>, a: &Value, days: i64, fresh: bool) -> Value {
 			Ok(token) => match platform {
 				Platform::Youtube => youtube(app, &token, &mut s).await,
 				Platform::Instagram => {
-					let ig_id = crate::accounts::get_account(app, &id).map(|r| r.external_id).unwrap_or_default();
-					instagram(app, &token, &ig_id, &mut s).await
+					let row = crate::accounts::get_account(app, &id);
+					let ig_id = row.as_ref().map(|r| r.external_id.clone()).unwrap_or_default();
+					// Accounts connected through Facebook live on graph.facebook.com.
+					let g = match &row {
+						Some(r) if crate::platforms::instagram::via_facebook(r) => crate::platforms::instagram::FB_GRAPH.to_string(),
+						_ => format!("{}/{}", app.endpoints.instagram_graph, app.cfg.instagram_api_version),
+					};
+					instagram(app, &g, &token, &ig_id, &mut s).await
 				}
 				Platform::Tiktok => tiktok(app, &token, &mut s).await,
 			},
@@ -222,9 +228,10 @@ fn ages(rows: impl Iterator<Item = (String, String, f64)>) -> Vec<Value> {
 
 // ---------- Instagram ----------
 
-async fn instagram(app: &App, token: &str, ig_id: &str, s: &mut Stats) -> Result<(), PubError> {
-	let g = format!("{}/{}", app.endpoints.instagram_graph, app.cfg.instagram_api_version);
-	let me = json(app, Req::get(&format!("{g}/me?fields=followers_count,media_count")).bearer(token)).await?;
+async fn instagram(app: &App, g: &str, token: &str, ig_id: &str, s: &mut Stats) -> Result<(), PubError> {
+	// On graph.facebook.com "me" is the Facebook user, so ask for the Instagram account itself.
+	let who = if g.starts_with(crate::platforms::instagram::FB_GRAPH) { ig_id } else { "me" };
+	let me = json(app, Req::get(&format!("{g}/{who}?fields=followers_count,media_count")).bearer(token)).await?;
 	s.followers = me["followers_count"].as_f64();
 	s.countries_of = "followers";
 

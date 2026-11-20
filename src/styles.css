@@ -463,3 +463,46 @@ details.why p { margin: 6px 0 0; color: var(--ink-3); font-size: 11.5px; line-he
 .inbox-list li.sent { border-left-color: var(--ok); }
 .inbox-list li.failed { border-left-color: var(--bad); }
 .ghost-link.drafts-on { color: var(--ok); }
+
+/* ---------- phone access panel ---------- */
+.phone-panel { padding: 14px 18px; }
+.phone-panel .block-head { margin-bottom: 6px; }
+.phone-where { display: grid; gap: 4px; font-size: 12.5px; color: var(--ink-2); }
+.phone-where .mono { overflow-wrap: anywhere; }
+.pair-box { display: flex; gap: 14px; align-items: flex-start; margin-top: 12px; padding: 12px; border-radius: 12px; background: var(--s2); }
+.pair-box .qr { width: 168px; height: 168px; flex: none; border-radius: 8px; background: #fff; padding: 6px; }
+.phone-list { list-style: none; margin: 12px 0 0; padding: 0; display: grid; gap: 6px; }
+.phone-list li { display: flex; align-items: center; gap: 10px; font-size: 12.5px; padding: 6px 6px 6px 10px; border-radius: 8px; background: var(--s2); }
+
+/* ---------- phones: bottom tab bar, safe areas, thumb-sized controls ---------- */
+@media (max-width: 720px) {
+	html, body { overflow-x: hidden; }
+	.shell { display: block; height: auto; min-height: 100%; }
+	/* Navigation sits at the bottom, where a thumb reaches it, clear of the iPhone home indicator. */
+	.rail { position: fixed; left: 0; right: 0; bottom: 0; z-index: 30; justify-content: space-around; gap: 0; padding: 4px 6px calc(4px + env(safe-area-inset-bottom)); border-bottom: 0; border-top: 1px solid var(--line); background: #0e0e0f; }
+	.rail .brand { display: none; }
+	.rail .nav { flex: 1 1 0; height: 48px; justify-content: center; border-radius: 12px; }
+	.rail .nav.on { background: none; box-shadow: none; }
+	.rail .nav svg { width: 22px; height: 22px; }
+	.rail .nav .count { position: absolute; top: 4px; left: calc(50% + 6px); margin: 0; }
+	/* Status and toggles move to the top right corner, next to the page title. */
+	.rail-foot { position: fixed; top: calc(10px + env(safe-area-inset-top)); right: calc(10px + env(safe-area-inset-right)); z-index: 31; margin: 0; padding: 2px; gap: 2px; border-radius: 12px; background: rgba(14, 14, 15, 0.9); }
+	.rail-foot .ghost-link { width: 36px; height: 36px; padding: 0; justify-content: center; }
+	.rail-foot .signin-off { display: none; }
+	.page { padding: calc(14px + env(safe-area-inset-top)) calc(14px + env(safe-area-inset-right)) calc(88px + env(safe-area-inset-bottom)) calc(14px + env(safe-area-inset-left)); }
+	.topbar { padding-right: 168px; min-height: 36px; }
+	.topbar h1 { font-size: 22px; }
+	.dests .dest { flex: 1 1 100%; height: 52px; }
+	.dests .dest .check { margin-left: auto; width: 22px; height: 22px; }
+	.block-head { flex-wrap: wrap; }
+	.pair-box { flex-direction: column; align-items: center; text-align: center; }
+	.inbox-list li { grid-template-columns: minmax(0, 1fr); gap: 2px; }
+	/* 16 px text stops iOS Safari from zooming into a field when it is tapped. */
+	input, textarea, select, .field { font-size: 16px; }
+}
+/* Touch screens: controls at least 40 px tall, no hover-only cues. */
+@media (pointer: coarse) {
+	.btn, .btn.sm { min-height: 40px; }
+	.ghost-link { min-height: 40px; }
+	.dest { min-height: 52px; }
+}

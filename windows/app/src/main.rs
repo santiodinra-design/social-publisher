@@ -48,8 +48,16 @@ impl Shell for DesktopShell {
 	fn notify(&self, notice: &publisher_core::Notice) {
 		let (title, body, ok) = (notice.title.clone(), notice.body.clone(), notice.ok);
 		let handle = self.0.clone();
-		// WinRT and the webview both want the main thread.
+		let copy = notice.copy.clone().filter(|t| !t.trim().is_empty());
+		// WinRT, the clipboard owner window and the webview all want the main thread.
 		let _ = self.0.run_on_main_thread(move || {
+			// TikTok drafts cannot carry a caption, so it goes on the clipboard, ready to paste in TikTok.
+			if let (Some(text), Some(w)) = (copy.as_deref(), handle.get_webview_window("main")) {
+				let copied = w.hwnd().map_err(|e| e.to_string()).and_then(|h| toast::copy_text(h.0 as *mut std::ffi::c_void, text));
+				if let (Err(e), Some(r)) = (copied, RUNNING.get()) {
+					r.app.log.line(&format!("caption not copied: {e}"));
+				}
+			}
 			if let Err(e) = toast::show(&title, &body) {
 				if let Some(r) = RUNNING.get() {
 					r.app.log.line(&format!("notification not shown: {e}"));
@@ -162,6 +170,7 @@ fn build_tray(handle: &AppHandle) -> tauri::Result<()> {
 		.separator()
 		.text("logs", "Show Logs in Explorer")
 		.text("data", "Show Data Folder in Explorer")
+		.text("inbox", "Show Inbox Folder in Explorer")
 		.text("about", "About Publisher")
 		.separator()
 		.text("quit", "Quit Publisher")
@@ -180,6 +189,13 @@ fn build_tray(handle: &AppHandle) -> tauri::Result<()> {
 		"data" => {
 			if let Some(r) = RUNNING.get() {
 				let _ = open::that_detached(&r.user_data);
+			}
+		}
+		"inbox" => {
+			if let Some(r) = RUNNING.get() {
+				let dir = publisher_core::inbox::dir(&r.app);
+				let _ = std::fs::create_dir_all(&dir);
+				let _ = open::that_detached(&dir);
 			}
 		}
 		"about" => {
@@ -424,6 +440,21 @@ fn boot(handle: AppHandle) {
 				}
 				app.log.line(&format!("[worker] stopped unexpectedly ({outcome:?}); restarting"));
 				tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+			}
+		});
+	}
+
+	{
+		// The inbox folder turns dropped videos into drafts (same as the Mac app's ~/Movies/Publisher Inbox).
+		let app = app.clone();
+		runtime.spawn(async move { publisher_core::inbox::start(app) });
+	}
+	{
+		// Phone access (off unless the owner turned it on): also listen on this PC's Wi-Fi address.
+		let app = app.clone();
+		runtime.spawn(async move {
+			if let Some(problem) = publisher_core::phone::start(&app) {
+				app.log.line(&format!("[phone] {problem}"));
 			}
 		});
 	}

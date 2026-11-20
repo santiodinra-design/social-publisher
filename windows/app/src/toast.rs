@@ -44,3 +44,47 @@ pub fn show(title: &str, body: &str) -> Result<(), String> {
 	let toast = ToastNotification::CreateToastNotification(&doc).map_err(|e| e.to_string())?;
 	ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(APP_ID)).and_then(|n| n.Show(&toast)).map_err(|e| e.to_string())
 }
+
+/// Puts plain text on the Windows clipboard (CF_UNICODETEXT), for pasting the caption into TikTok.
+/// `owner` is the app window: with no owner, EmptyClipboard leaves the clipboard unowned and
+/// SetClipboardData then fails.
+pub fn copy_text(owner: *mut std::ffi::c_void, text: &str) -> Result<(), String> {
+	use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND};
+	use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData};
+	use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+	const CF_UNICODETEXT: u32 = 13;
+	let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+	unsafe {
+		// Another program may hold the clipboard for a moment, so try a few times.
+		let mut opened = false;
+		for _ in 0..10 {
+			if OpenClipboard(Some(HWND(owner))).is_ok() {
+				opened = true;
+				break;
+			}
+			std::thread::sleep(std::time::Duration::from_millis(30));
+		}
+		if !opened {
+			return Err("the clipboard is busy".into());
+		}
+		let result = (|| -> Result<(), String> {
+			EmptyClipboard().map_err(|e| e.to_string())?;
+			let mem: HGLOBAL = GlobalAlloc(GMEM_MOVEABLE, wide.len() * 2).map_err(|e| e.to_string())?;
+			let ptr = GlobalLock(mem) as *mut u16;
+			if ptr.is_null() {
+				let _ = GlobalFree(Some(mem));
+				return Err("could not lock clipboard memory".into());
+			}
+			std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr, wide.len());
+			let _ = GlobalUnlock(mem);
+			// On success the clipboard owns the memory.
+			if let Err(e) = SetClipboardData(CF_UNICODETEXT, Some(HANDLE(mem.0))) {
+				let _ = GlobalFree(Some(mem));
+				return Err(e.to_string());
+			}
+			Ok(())
+		})();
+		let _ = CloseClipboard();
+		result
+	}
+}

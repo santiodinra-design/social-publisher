@@ -20,6 +20,7 @@ import { LIMITS, isShortsShape, probe, validateMedia, VIDEO_MIME, type Issue } f
 import { ADAPTERS, adapterFor, PLATFORMS } from './platforms/index.js';
 import { checkKeys, draftsOnly, FIELDS, saveSettings, setupView } from './settings.js';
 import { inboxStatus } from './inbox.js';
+import * as phone from './phone.js';
 import type { MediaRow } from './platforms/types.js';
 import { AuthError } from './platforms/types.js';
 
@@ -60,13 +61,21 @@ export async function buildApp(opts: { logger?: boolean } = {}) {
 		return want.length > 0 && got.length === want.length && crypto.timingSafeEqual(got, want);
 	};
 	// Desktop: only the app's own window holds the per-launch cookie. Loopback alone is not trusted.
-	const authed = (req: FastifyRequest) => (config.desktop ? desktopOk(req) : config.noSignIn || Boolean(readSignedToken<{ u: string }>(req.cookies[SESSION])));
-	const isOpen = (url: string) => url === '/api/session' || url.startsWith('/m/') || /^\/api\/oauth\/[a-z]+\/callback$/.test(url) || !url.startsWith('/api/');
+	// A paired phone (phone.ts) holds its own key instead and may do less.
+	const phoneOf = (req: FastifyRequest) => (config.desktop && !desktopOk(req) ? phone.deviceOf(req) : null);
+	const authed = (req: FastifyRequest) => (config.desktop ? desktopOk(req) || Boolean(phone.deviceOf(req)) : config.noSignIn || Boolean(readSignedToken<{ u: string }>(req.cookies[SESSION])));
+	const isOpen = (url: string) => url === '/api/session' || url.startsWith('/m/') || url.startsWith('/pair/') || /^\/api\/oauth\/[a-z]+\/callback$/.test(url) || !url.startsWith('/api/');
 
 	app.addHook('onRequest', async (req, reply) => {
-		const url = req.url.split('?')[0];
+		// Decide on the decoded path, as the router sees it. Checking the raw URL let "/%61pi/accounts"
+		// skip the sign-in check while the router still served /api/accounts.
+		const url = routedPath(req.url);
+		// Fail closed if this reading and the router's ever disagree about whether this is the API.
+		const route = req.routeOptions?.url;
+		if (url === null || (route?.startsWith('/api/') && !url.startsWith('/api/'))) return reply.code(400).send({ error: 'Bad request.' });
 		const open = isOpen(url);
 		if (!open && !authed(req)) return reply.code(401).send({ error: 'Sign in first.' });
+		if (!open && phoneOf(req) && phone.blocked(req.method, url)) return reply.code(403).send({ error: 'Do this in Publisher on the computer.' });
 		// Simple CSRF guard: state-changing API calls must come from this app.
 		if (!open && !['GET', 'HEAD'].includes(req.method) && req.headers['x-requested-with'] !== 'social-publisher') return reply.code(403).send({ error: 'Blocked request.' });
 	});
@@ -105,16 +114,47 @@ export async function buildApp(opts: { logger?: boolean } = {}) {
 		reply.setCookie(SESSION, signedToken({ u: 'owner' }, 14 * 86400), { httpOnly: true, sameSite: 'lax', secure, path: '/', maxAge: 14 * 86400 });
 		return { ok: true };
 	});
-	app.get('/api/session', async (req) => ({ signedIn: authed(req), demoMode: config.demoMode, noSignIn: config.noSignIn && !config.desktop, desktop: config.desktop }));
+	app.get('/api/session', async (req) => {
+		const isPhone = Boolean(phoneOf(req));
+		return { signedIn: authed(req), demoMode: config.demoMode, noSignIn: config.noSignIn && !config.desktop, desktop: config.desktop && !isPhone, phone: isPhone, phonePairing: config.desktop && phone.enabled() };
+	});
 	// Worker health comes from the worker's own heartbeat, not from this server answering.
 	app.get('/api/status', async () => {
 		const db = getDb();
 		const active = (db.prepare("SELECT COUNT(*) AS n FROM targets WHERE state IN ('queued','uploading','processing')").get() as { n: number }).n;
 		return { worker: workerStatus(), activeJobs: active, noSignIn: config.noSignIn && !config.desktop, demoMode: config.demoMode, now: now() };
 	});
-	app.delete('/api/session', async (_req, reply) => {
+	app.delete('/api/session', async (req, reply) => {
 		reply.clearCookie(SESSION, { path: '/' });
+		// A paired phone signing out forgets itself, so it needs a new QR code to come back.
+		const id = phoneOf(req);
+		if (id) {
+			phone.remove(id);
+			reply.clearCookie(phone.COOKIE, { path: '/' });
+		}
 		return { ok: true };
+	});
+
+	// ---------- phone access (desktop app; see phone.ts) ----------
+	app.get('/api/phone', async () => phone.view());
+	app.put('/api/phone', async (req, reply) => {
+		const on = (req.body as any)?.enabled;
+		if (typeof on !== 'boolean') return reply.code(400).send({ error: 'Check the fields.' });
+		return phone.setEnabled(app, on);
+	});
+	app.post('/api/phone/pair', async (_req, reply) => {
+		try {
+			return await phone.pair();
+		} catch (e: any) {
+			return reply.code(409).send({ error: e.message });
+		}
+	});
+	app.delete('/api/phone/devices/:id', async (req, reply) => (phone.remove((req.params as any).id) ? phone.view() : reply.code(404).send({ error: 'Not found' })));
+	app.get('/pair/:secret', async (req, reply) => {
+		const value = phone.redeem((req.params as any).secret, String(req.headers['user-agent'] ?? ''));
+		if (!value) return reply.code(410).type('text/html; charset=utf-8').header('Cache-Control', 'no-store').send(callbackPage(false, 'This pairing link has expired or was already used. In Publisher on the computer, open Connected accounts → Phone access and scan a new code.'));
+		reply.setCookie(phone.COOKIE, value, { httpOnly: true, sameSite: 'lax', secure: req.headers['x-forwarded-proto'] === 'https', path: '/', maxAge: 365 * 86400 });
+		return reply.type('text/html; charset=utf-8').header('Cache-Control', 'no-store').send('<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Publisher</title><body style="background:#0c0c0d"><script>location.replace("/")</script>');
 	});
 
 	// ---------- config ----------
@@ -122,7 +162,7 @@ export async function buildApp(opts: { logger?: boolean } = {}) {
 		demoMode: config.demoMode,
 		publicBaseUrl: Boolean(config.publicBaseUrl),
 		// Extras shared with the Windows build. The UI shows a feature only when it is listed here.
-		features: [...FEATURES, ...(config.desktop ? ['notifications', 'inbox'] : [])],
+		features: [...FEATURES, ...(config.desktop ? ['notifications', 'inbox', 'phone'] : [])],
 		draftsOnly: draftsOnly(),
 		platforms: Object.fromEntries(PLATFORMS.map((p) => [p, { configured: configured[p](), ...ADAPTERS[p].availability(), limits: LIMITS[p] }])),
 	}));
@@ -457,6 +497,28 @@ export async function buildApp(opts: { logger?: boolean } = {}) {
 		app.setNotFoundHandler((req, reply) => (req.url.startsWith('/api/') ? reply.code(404).send({ error: 'Not found' }) : reply.sendFile('index.html')));
 	}
 	return app;
+}
+
+/**
+ * The path the router acts on, decoded, for the access checks. Handles an absolute request target
+ * ("GET http://host/api/x"), and cuts at "?", "#" and ";" (stricter than the router, never looser).
+ * Checking the raw URL once let "/%61pi/accounts" skip the sign-in check. Null when it cannot be read.
+ */
+export function routedPath(raw: string): string | null {
+	let p = raw;
+	if (!p.startsWith('/')) {
+		try {
+			p = new URL(p).pathname;
+		} catch {
+			return null;
+		}
+	}
+	p = p.split(/[?#;]/)[0];
+	try {
+		return decodeURIComponent(p);
+	} catch {
+		return null;
+	}
 }
 
 const esc = (s: string) => s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!);

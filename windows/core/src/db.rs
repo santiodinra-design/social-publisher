@@ -150,6 +150,10 @@ fn migrate(c: &Connection) -> rusqlite::Result<()> {
 	// Added by the Windows app. Optional columns, so the Mac app can still open the same database.
 	add_column(c, "posts", "scheduled_at", "INTEGER")?;
 	add_column(c, "posts", "notified_at", "INTEGER")?;
+	// Saved account groups ("Post to" shortcuts), same table as the Mac app.
+	// Phones paired with this computer. Only a hash of each phone's key is kept.
+	c.execute_batch("CREATE TABLE IF NOT EXISTS devices (id TEXT PRIMARY KEY, name TEXT NOT NULL, token_hash TEXT NOT NULL, created_at INTEGER NOT NULL, last_seen_at INTEGER)")?;
+	c.execute_batch("CREATE TABLE IF NOT EXISTS account_groups (id TEXT PRIMARY KEY, name TEXT NOT NULL, account_ids TEXT NOT NULL, created_at INTEGER NOT NULL)")?;
 	Ok(())
 }
 

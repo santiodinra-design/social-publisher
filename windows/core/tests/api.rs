@@ -55,7 +55,7 @@ async fn the_api_is_locked_to_the_app_window() {
 	// Password sign-in does not exist in the desktop app.
 	assert_eq!(bare(Method::POST, "/api/session").json(&json!({ "password": "x" })).send().await.unwrap().status(), 403);
 	let s: Value = bare(Method::GET, "/api/session").send().await.unwrap().json().await.unwrap();
-	assert_eq!(s, json!({ "signedIn": false, "demoMode": true, "noSignIn": false, "desktop": true }));
+	assert_eq!(s, json!({ "signedIn": false, "demoMode": true, "noSignIn": false, "desktop": true, "phone": false, "phonePairing": false }));
 	assert_eq!(api.get("/api/session").await["signedIn"], true);
 	// Unknown API paths are JSON 404s, not the page.
 	assert_eq!(api.req(Method::GET, "/api/nope").send().await.unwrap().status(), 404);
@@ -134,6 +134,16 @@ async fn upload_publish_and_history_in_demo_mode() {
 		"caption": "hello",
 		"targets": [target(&by("youtube"), json!({ "title": "My clip", "privacy": "private", "madeForKids": false })), target(&by("instagram"), json!({})), target(&by("tiktok"), json!({}))],
 	});
+	// Drafts only is on by default, as on the Mac: Instagram has no drafts, so it is refused...
+	assert_eq!(api.get("/api/config").await["draftsOnly"], true);
+	let (status, body) = api.send(Method::POST, "/api/posts", good.clone()).await;
+	assert_eq!(status, 422);
+	assert!(body["issues"][0]["message"].as_str().unwrap().contains("Instagram has no drafts"), "{body}");
+	assert_eq!(api.get("/api/posts").await, json!([]));
+	// Turning it off allows Instagram again (TikTok and the inbox folder: tests/mac_parity.rs).
+	let (status, prefs) = api.send(Method::PUT, "/api/desktop/prefs", json!({ "draftsOnly": false })).await;
+	assert_eq!((status, prefs["draftsOnly"].clone()), (StatusCode::OK, json!(false)));
+
 	let (status, created) = api.send(Method::POST, "/api/posts", good.clone()).await;
 	assert_eq!(status, 200, "{created}");
 	assert_eq!(created["duplicate"], false);

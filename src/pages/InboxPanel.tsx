@@ -20,7 +20,7 @@ export function InboxPanel() {
 				{desktop?.revealInbox && <button type="button" className="btn sm" onClick={() => desktop!.revealInbox!()}>Open folder</button>}
 			</div>
 			<p className="hint" style={{ margin: '0 0 8px' }}>
-				Your Claude sessions save finished videos with a caption file into <span className="mono">{inbox.dir.replace(/^\/Users\/[^/]+/, '~')}</span>. Publisher sends each one as drafts: YouTube Private and TikTok inbox. Instagram is never used from here. Keep Publisher open.
+				Your Claude sessions save finished videos with a caption file into <span className="mono">{inbox.dir.replace(/^\/Users\/[^/]+/, '~').replace(/^[A-Za-z]:\\Users\\[^\\]+/, '~')}</span>. Publisher sends each one: YouTube with the visibility in the caption file (Public if it says none) and TikTok to the inbox, with the caption copied for you to paste. Instagram is never used from here. Keep Publisher open.
 			</p>
 			{inbox.recent.length ? (
 				<ul className="inbox-list">

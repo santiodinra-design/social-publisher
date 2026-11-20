@@ -111,6 +111,8 @@ function migrate(d: DatabaseSync) {
 	`);
 	// Added with the scheduling and finish-notification features (same columns as the Windows build).
 	// Saved account groups ("Post to" shortcuts).
+	// Phones paired with the desktop app. Only a hash of each phone's key is kept.
+	d.exec('CREATE TABLE IF NOT EXISTS devices (id TEXT PRIMARY KEY, name TEXT NOT NULL, token_hash TEXT NOT NULL, created_at INTEGER NOT NULL, last_seen_at INTEGER)');
 	d.exec('CREATE TABLE IF NOT EXISTS account_groups (id TEXT PRIMARY KEY, name TEXT NOT NULL, account_ids TEXT NOT NULL, created_at INTEGER NOT NULL)');
 	for (const [table, column, kind] of [['posts', 'scheduled_at', 'INTEGER'], ['posts', 'notified_at', 'INTEGER']] as const) {
 		const cols = d.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
